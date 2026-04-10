@@ -1,0 +1,17 @@
+[Unit]
+Description=Plex Auto Transcoder (HEVC QSV)
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=bennetgriese
+Group=bennetgriese
+SupplementaryGroups=render video
+WorkingDirectory=/home/bennetgriese/plex/transcoder
+Environment="PATH=/home/bennetgriese/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/python3 /home/bennetgriese/plex/transcoder/auto_transcoder.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

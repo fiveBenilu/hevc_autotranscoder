@@ -1,0 +1,3 @@
+transcoder.db
+*.tmp.mkv
+__pycache__/
