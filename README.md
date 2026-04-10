@@ -7,21 +7,21 @@ Ein maßgeschneidertes, automatisiertes Skript, das nächtlich Überprüfungen d
 - **Intelligente Filterung**: Überspringt bereits in HEVC kodierte Dateien, es sei denn, sie sind größer als 5 GB (dann werden sie zur Platzersparnis erneut komprimiert).
 - **Apple-like Web-Dashboard**: Unter `http://<server-ip>:5000` läuft ein minimalistisches Frontend mit Dark/Light-Mode und automatischen (Echtzeit) Statusaktualisierungen per AJAX.
 - **SQLite-Tracking**: Alle Fortschritte, Ersparnisse und Laufzeiten werden in einer lokalen Datenbank (`transcoder.db`) getrackt, sodass keine Datei fälschlicherweise doppelt bearbeitet wird.
-- **Hardware-Passthrough**: Umgeht fehlende proprietäre Debian 13 Treiber (Trixie), indem ein `lscr.io/linuxserver/ffmpeg:latest` Docker-Container für den reinen Transkodierungs-Job gespawnt wird (mit `/dev/dri`-Passthrough).
+- **Hardware-Passthrough**: Umgeht eventuelle Fehler bezüglich fehlender proprietärer Linux-Host-Treiber, indem ein `lscr.io/linuxserver/ffmpeg:latest` Docker-Container für den reinen Transkodierungs-Job gespawnt wird (mit `/dev/dri`-Passthrough).
 
-## 📁 Dateistruktur (in `/home/bennetgriese/plex/transcoder/`)
+## 📁 Dateistruktur
 - `auto_transcoder.py`: Das Herzstück. Beinhaltet die Logik zum Scannen, die Subprocess-Aufrufe für Docker und den integrierten Flask-Webserver inkl. Dashboard HTML/JS.
 - `transcoder.db`: Die SQLite-Datenbank für Historie und Status.
 - `plex-transcoder.service`: Die Systemd-Service-Datei, die für den automatischen Hintergrundbetrieb sorgt (inklusive Berechtigungen für Hardware-Beschleunigung).
 
 ## ⚙️ Wie funktioniert das Hardware-Encoding?
-Dein **Intel i5 8500T** (UHD 630) hat Hardware-Encodierung verbaut.
+Das System setzt eine entsprechende Intel CPU mit Hardware-Encodierung (Quick Sync) voraus.
 Das Skript greift via `/dev/dri/renderD128` auf das Gerät zu.
-Da das lokale Debian gelegentlich Hürden bezüglich proprietärer Codecs aufweist, startet das Skript intern folgenden Docker-Befehl für jede Datei:
+Um Treiber-Konflikten auf dem Host-System aus dem Weg zu gehen, startet das Skript intern folgenden Docker-Befehl für jede Datei:
 ```bash
 docker run --rm \
   --device=/dev/dri:/dev/dri \
-  -v /home/bennetgriese/plex/media:/home/bennetgriese/plex/media \
+  -v /pfad/zu/deinen/medien:/pfad/zu/deinen/medien \
   lscr.io/linuxserver/ffmpeg:latest \
   -y -vaapi_device /dev/dri/renderD128 \
   -i <INPUT> -vf format=nv12,hwupload -c:v hevc_vaapi \
@@ -35,7 +35,7 @@ Neben dem Web-Dashboard kannst du jederzeit über die Kommandozeile nachschauen,
 
 1. **Größe der temporären Datei (Echtzeit) beobachten:**
    ```bash
-   watch -n 2 'ls -lh /home/bennetgriese/plex/media/*/*/*.hevc.tmp.mkv 2>/dev/null'
+   watch -n 2 'ls -lh /pfad/zu/deinen/medien/*/*/*.hevc.tmp.mkv 2>/dev/null'
    ```
 2. **Log-Ausgabe des Skripts (Live-Verfolgung):**
    ```bash
@@ -47,10 +47,10 @@ Neben dem Web-Dashboard kannst du jederzeit über die Kommandozeile nachschauen,
    ```
 
 ## 🛠️ Systemd Dienstverwaltung
-Solltest du das Skript stoppen oder neustarten wollen:
+Sollte das Skript über Systemd eingebunden sein:
 - Starten: `sudo systemctl start plex-transcoder`
 - Stoppen: `sudo systemctl stop plex-transcoder`
 - Neustarten: `sudo systemctl restart plex-transcoder`
 - Status: `sudo systemctl status plex-transcoder`
 
-**Wichtig:** Der Dienst läuft unter dem User `bennetgriese` und hat zur Grafik-Nutzung die ergänzenden Berechtigungsgruppen `render` und `video` hinterlegt.
+**Wichtig:** Der ausführende User benötigt zur Grafik-Nutzung die ergänzenden Berechtigungsgruppen `render` und `video`.
