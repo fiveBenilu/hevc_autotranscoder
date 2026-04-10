@@ -2,6 +2,30 @@
 
 Ein maßgeschneidertes, automatisiertes Skript, das nächtlich Überprüfungen der Film- und Serienbibliothek durchführt und große Videodateien mithilfe der **Intel Quick Sync Video (QSV)** Hardwarebeschleunigung in platzsparendes **HEVC (H.265)** konvertiert.
 
+## 🚀 Voraussetzungen & Installation
+
+Verwende diese simplen Copy-Paste-Befehle, um dieses Projekt auf einem frischen Linux-System (z.B. Debian/Ubuntu) einzurichten. So wird Docker, Python 3, Flask und der nötige GPU-Zugriff für die Hardwarebeschleunigung installiert und aktiviert:
+
+```bash
+# 1. Systempakete (Docker, Git, Python Flask & SQLite) installieren
+sudo apt update
+sudo apt install -y docker.io git python3 python3-flask sqlite3
+
+# 2. Aktuellen Benutzer zu den Systemgruppen (für Docker & Intel CPU-Zugriff) hinzufügen
+sudo usermod -aG docker $USER
+sudo usermod -aG render $USER
+sudo usermod -aG video $USER
+
+# WICHTIG: Nach diesem Schritt kurz vom Server abmelden und erneut anmelden, damit die Rechte greifen!
+
+# 3. Repository klonen und in den Ordner wechseln
+git clone https://github.com/fiveBenilu/hevc_autotranscoder.git
+cd hevc_autotranscoder
+
+# 4. Optional: Skript direkt testweise starten (Web-Interface startet auf Port 5000)
+python3 auto_transcoder.py
+```
+
 ## 🌟 Features
 - **Automatischer Nacht-Modus**: Das Skript läuft selbstständig zwischen 01:00 und 07:00 Uhr, um Serverressourcen tagsüber zu schonen.
 - **Intelligente Filterung**: Überspringt bereits in HEVC kodierte Dateien, es sei denn, sie sind größer als 5 GB (dann werden sie zur Platzersparnis erneut komprimiert).
