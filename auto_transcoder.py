@@ -474,12 +474,10 @@ HTML_TEMPLATE = """
         function suggestDir() {
             const input = document.getElementById('new-dir');
             const drop = document.getElementById('dir-suggestions');
-            const val = input.value;
+            let val = input.value;
             
-            if (val.length < 1) {
-                drop.style.display = 'none';
-                return;
-            }
+            // Default to root if empty, so it displays something initially
+            if (val.length === 0) val = '/';
             
             fetch('/api/suggest_dir?path=' + encodeURIComponent(val))
             .then(r => r.json())
@@ -773,7 +771,7 @@ def remove_dir(id):
 def suggest_dir():
     path_input = request.args.get("path", "")
     if not path_input:
-        return jsonify({"folders": []})
+        path_input = "/"
 
     if path_input.endswith('/'):
         base_dir = path_input
@@ -793,10 +791,11 @@ def suggest_dir():
     folders = []
     for item in sorted(items):
         item_path = os.path.join(base_dir, item)
+        # Show all directories, no matter if they are hidden (start with .)
         if os.path.isdir(item_path) and item.lower().startswith(prefix.lower()):
             folders.append({"name": item, "path": item_path})
 
-    return jsonify({"folders": folders[:15]})
+    return jsonify({"folders": folders})
 
 @app.route("/start_scan", methods=["POST"])
 def manual_start():
