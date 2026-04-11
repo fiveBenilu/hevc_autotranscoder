@@ -471,6 +471,54 @@ HTML_TEMPLATE = """
             });
         }
         
+        function suggestDir() {
+            const input = document.getElementById('new-dir');
+            const drop = document.getElementById('dir-suggestions');
+            const val = input.value;
+            
+            if (val.length < 1) {
+                drop.style.display = 'none';
+                return;
+            }
+            
+            fetch('/api/suggest_dir?path=' + encodeURIComponent(val))
+            .then(r => r.json())
+            .then(data => {
+                if (data.folders && data.folders.length > 0) {
+                    drop.innerHTML = data.folders.map(f => {
+                        const safePath = f.path.replace(/"/g, '&quot;');
+                        return `<div style="padding: 10px 12px; cursor: pointer; border-bottom: 1px solid var(--border); display: flex; align-items: center;" 
+                                      onclick="selectDir(event, this.dataset.path)" data-path="${safePath}"
+                                      onmouseover="this.style.background='var(--bg-color)'"
+                                      onmouseout="this.style.background='transparent'">
+                                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="var(--acc-blue)" stroke-width="2" style="margin-right: 8px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                                    ${f.name}
+                                 </div>`;
+                    }).join('');
+                    drop.style.display = 'block';
+                } else {
+                    drop.style.display = 'none';
+                }
+            });
+        }
+        
+        function selectDir(e, path) {
+            e.preventDefault();
+            e.stopPropagation();
+            const input = document.getElementById('new-dir');
+            input.value = path + '/';
+            document.getElementById('dir-suggestions').style.display = 'none';
+            input.focus();
+            suggestDir(); // fetch next level immediately
+        }
+
+        document.addEventListener('click', function(e) {
+            if (e.target.id !== 'new-dir') {
+                const drop = document.getElementById('dir-suggestions');
+                if(drop) drop.style.display = 'none';
+            }
+        });
+
         function addDir(event) {
             event.preventDefault();
             const input = document.getElementById('new-dir');
@@ -478,7 +526,11 @@ HTML_TEMPLATE = """
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({path: input.value})
-            }).then(() => { input.value = ''; loadSettings(); });
+            }).then(() => { 
+                input.value = ''; 
+                document.getElementById('dir-suggestions').style.display = 'none';
+                loadSettings(); 
+            });
         }
         
         function removeDir(id) {
@@ -605,9 +657,14 @@ HTML_TEMPLATE = """
             <div class="card">
                 <h3>Monitored Directories</h3>
                 <ul id="dir-list" class="dir-list"></ul>
-                <form onsubmit="addDir(event)" style="display: flex; gap: 10px; margin-top: 15px;">
-                    <input type="text" id="new-dir" placeholder="Absolute directory path..." required>
-                    <button type="submit" class="btn">Add Directory</button>
+                <form onsubmit="addDir(event)" style="margin-top: 15px;">
+                    <div style="display: flex; gap: 10px; position: relative;">
+                        <div style="flex: 1; position: relative;">
+                            <input type="text" id="new-dir" style="width: 100%; box-sizing: border-box;" placeholder="Type /home/... to browse" oninput="suggestDir()" onclick="suggestDir()" autocomplete="off" required>
+                            <div id="dir-suggestions" style="display: none; position: absolute; width: 100%; top: calc(100% + 5px); background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; max-height: 250px; overflow-y: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 100;"></div>
+                        </div>
+                        <button type="submit" class="btn">Add Directory</button>
+                    </div>
                 </form>
             </div>
         </div>
@@ -711,6 +768,35 @@ def remove_dir(id):
     conn.commit()
     conn.close()
     return jsonify({"success": True})
+
+@app.route("/api/suggest_dir")
+def suggest_dir():
+    path_input = request.args.get("path", "")
+    if not path_input:
+        return jsonify({"folders": []})
+
+    if path_input.endswith('/'):
+        base_dir = path_input
+        prefix = ""
+    else:
+        base_dir = os.path.dirname(path_input)
+        prefix = os.path.basename(path_input)
+
+    if not os.path.exists(base_dir) or not os.path.isdir(base_dir):
+        return jsonify({"folders": []})
+
+    try:
+        items = os.listdir(base_dir)
+    except Exception:
+        return jsonify({"folders": []})
+
+    folders = []
+    for item in sorted(items):
+        item_path = os.path.join(base_dir, item)
+        if os.path.isdir(item_path) and item.lower().startswith(prefix.lower()):
+            folders.append({"name": item, "path": item_path})
+
+    return jsonify({"folders": folders[:15]})
 
 @app.route("/start_scan", methods=["POST"])
 def manual_start():
