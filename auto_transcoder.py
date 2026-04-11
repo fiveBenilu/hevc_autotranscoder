@@ -4,15 +4,13 @@ import subprocess
 import sqlite3
 import time
 import threading
+import json
 from datetime import datetime
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request, redirect
 
 app = Flask(__name__)
 
 DB_FILE = "transcoder.db"
-MOVIES_DIR = "/home/bennetgriese/plex/media/movies"
-TV_DIR = "/home/bennetgriese/plex/media/tv"
-
 ALLOWED_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov')
 
 # Events & state
@@ -41,11 +39,42 @@ def get_sys_stats():
     # CPU Load
     try:
         load1, load5, load15 = os.getloadavg()
-        cpu_str = f"Load (1m): {round(load1,2)}"
+        cpu_str = f"{round(load1,2)}"
     except:
         cpu_str = "N/A"
         
-    return cpu_str, ram_str
+    temp_str = "N/A"
+    try:
+        with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+            temp = float(f.read().strip()) / 1000
+            temp_str = f"{round(temp, 1)}°C"
+    except:
+        pass
+
+    return cpu_str, temp_str, ram_str
+
+def get_storage_stats():
+    drives = []
+    try:
+        output = subprocess.check_output(['df', '-B1'], text=True)
+        lines = output.strip().split('\n')[1:]
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 6:
+                fs, total, used, free, perc = parts[0], int(parts[1]), int(parts[2]), int(parts[3]), parts[4]
+                mount = " ".join(parts[5:])
+                if fs.startswith('/dev/') and not '/loop' in fs:
+                    drives.append({
+                        "mount": mount,
+                        "fs": fs,
+                        "total": format_size(total),
+                        "used": format_size(used),
+                        "free": format_size(free),
+                        "perc": perc
+                    })
+    except:
+        pass
+    return drives
 
 def format_size(size_bytes):
     if not size_bytes:
@@ -73,12 +102,42 @@ def init_db():
             finished_at DATETIME
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS directories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT UNIQUE
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('quality', '23')")
+    # Migrate old hardcoded dirs if empty
+    c.execute("SELECT COUNT(*) FROM directories")
+    if c.fetchone()[0] == 0:
+        for d in ["/home/bennetgriese/plex/media/movies", "/home/bennetgriese/plex/media/tv"]:
+            if os.path.exists(d):
+                c.execute("INSERT INTO directories (path) VALUES (?)", (d,))
     conn.commit()
     conn.close()
 
+def get_settings():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key='quality'")
+    row = c.fetchone()
+    q = row[0] if row else "23"
+    
+    c.execute("SELECT id, path FROM directories")
+    dirs = [{"id": r[0], "path": r[1]} for r in c.fetchall()]
+    conn.close()
+    return {"quality": q, "directories": dirs}
+
 def is_night_time():
     hour = datetime.now().hour
-    # Run only between 01:00 AM and 07:00 AM
     return 1 <= hour < 7
 
 def get_video_codec(filepath):
@@ -93,18 +152,19 @@ def get_video_codec(filepath):
     except:
         return None
 
-def process_file(filepath):
+def process_file(filepath, quality):
     filename = os.path.basename(filepath)
-    old_size = os.path.getsize(filepath)
+    try:
+        old_size = os.path.getsize(filepath)
+    except:
+        return
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
-    # Check if already in DB
     c.execute("SELECT status FROM conversions WHERE filepath=?", (filepath,))
     row = c.fetchone()
     
-    # If completed or in progress, ignore
     if row and row[0] in ('COMPLETED', 'IN_PROGRESS'):
         conn.close()
         return
@@ -112,9 +172,6 @@ def process_file(filepath):
     codec = get_video_codec(filepath)
     is_hevc = codec in ('hevc', 'h265')
     
-    # Skip if it is already HEVC AND smaller than 5 GB
-    # If it is HEVC but >= 5 GB, we will transcode it again to shrink it.
-    # If it was previously marked as SKIPPED, we check again.
     if is_hevc and old_size < (5 * 1024 * 1024 * 1024):
         if not row or row[0] != 'SKIPPED':
             c.execute('''INSERT OR REPLACE INTO conversions 
@@ -126,7 +183,6 @@ def process_file(filepath):
         conn.close()
         return
 
-    # Start Conversion
     c.execute('''INSERT OR REPLACE INTO conversions 
                  (filename, filepath, old_size_bytes, status, started_at) 
                  VALUES (?, ?, ?, 'IN_PROGRESS', ?)''', 
@@ -134,7 +190,6 @@ def process_file(filepath):
     conn.commit()
     print(f"[{datetime.now()}] Transcoding: {filename}")
     
-    # Needs HEVC
     tmp_filepath = filepath + ".hevc.tmp.mkv"
     
     cmd = [
@@ -146,7 +201,7 @@ def process_file(filepath):
         "-vaapi_device", "/dev/dri/renderD128",
         "-i", filepath,
         "-vf", "format=nv12,hwupload",
-        "-c:v", "hevc_vaapi", "-global_quality", "23",
+        "-c:v", "hevc_vaapi", "-global_quality", quality,
         "-c:a", "copy", "-c:s", "copy",
         tmp_filepath
     ]
@@ -155,10 +210,8 @@ def process_file(filepath):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0 and os.path.exists(tmp_filepath):
             new_size = os.path.getsize(tmp_filepath)
-            
-            # Replace original
             os.remove(filepath)
-            final_filepath = os.path.splitext(filepath)[0] + ".mkv" # Force MKV container if it was mp4/mov
+            final_filepath = os.path.splitext(filepath)[0] + ".mkv"
             os.rename(tmp_filepath, final_filepath)
             
             c.execute('''UPDATE conversions 
@@ -168,7 +221,7 @@ def process_file(filepath):
             conn.commit()
             print(f"[{datetime.now()}] Finished: {filename}. Saved {(old_size - new_size)/1024/1024:.2f} MB")
         else:
-            raise Exception(result.stderr[-500:]) # Last 500 chars of error
+            raise Exception(result.stderr[-500:])
             
     except Exception as e:
         if os.path.exists(tmp_filepath):
@@ -189,17 +242,21 @@ def scanner_loop():
             is_scanning = True
             force_scan_event.clear()
             
-            movies = glob.glob(f"{MOVIES_DIR}/**/*.*", recursive=True)
-            tv = glob.glob(f"{TV_DIR}/**/*.*", recursive=True)
-            all_files = movies + tv
+            settings = get_settings()
+            quality = settings["quality"]
+            dirs = [d["path"] for d in settings["directories"]]
+            
+            all_files = []
+            for d in dirs:
+                if os.path.exists(d):
+                    all_files.extend(glob.glob(f"{d}/**/*.*", recursive=True))
             
             for f in all_files:
                 if f.lower().endswith(ALLOWED_EXTENSIONS):
-                    process_file(f)
+                    process_file(f, quality)
                     
             is_scanning = False
                     
-        # Sleep incrementally up to 5 minutes, checking the event
         force_scan_event.wait(300)
 
 HTML_TEMPLATE = """
@@ -248,6 +305,12 @@ HTML_TEMPLATE = """
         h1 { font-weight: 600; font-size: 28px; margin-bottom: 5px; display: flex; align-items: center; gap: 10px; }
         p.subtitle { color: var(--text-sec); margin-top: 0; margin-bottom: 30px; font-size: 15px; }
         
+        .tabs { display: flex; gap: 15px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 10px;}
+        .tab { cursor: pointer; font-size: 16px; font-weight: 600; color: var(--text-sec); padding: 5px 10px; }
+        .tab.active { color: var(--acc-blue); border-bottom: 2px solid var(--acc-blue); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
         .header-cards { display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap; }
         .card { 
             background-color: var(--card-bg); 
@@ -265,22 +328,13 @@ HTML_TEMPLATE = """
         .card-value { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
         
         .btn { 
-            background-color: var(--acc-blue); 
-            color: white; 
-            padding: 12px 24px; 
-            border-radius: 20px; 
-            border: none; 
-            cursor: pointer; 
-            font-size: 15px; 
-            font-weight: 600;
-            display: inline-flex; 
-            align-items: center; 
-            gap: 8px;
-            transition: all 0.2s ease;
+            background-color: var(--acc-blue); color: white; padding: 10px 20px; border-radius: 20px; border: none; 
+            cursor: pointer; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 8px;
+            transition: all 0.2s ease; text-decoration: none;
         }
+        .btn-red { background-color: var(--acc-red); }
         .btn:hover { opacity: 0.9; transform: scale(0.98); }
         .btn-disabled { background-color: var(--border); color: var(--text-sec); cursor: not-allowed; }
-        .btn-disabled:hover { opacity: 1; transform: scale(1); }
         
         .sp { animation: spin 2s linear infinite; }
         @keyframes spin { 100% { transform: rotate(360deg); } }
@@ -299,13 +353,38 @@ HTML_TEMPLATE = """
         .icon { width: 20px; height: 20px; display: block; }
         .icon-sm { width: 16px; height: 16px; display: block; }
         .icon-lg { width: 28px; height: 28px; display: block; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1)); }
+        
+        /* Stats Tab Specifics */
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
+        
+        /* Settings Tab Specifics */
+        .form-group { margin-bottom: 20px; }
+        label { display: block; font-weight: 600; margin-bottom: 8px; }
+        input[type="range"] { width: 100%; max-width: 400px; accent-color: var(--acc-blue); }
+        .range-labels { display: flex; justify-content: space-between; max-width: 400px; color: var(--text-sec); font-size: 13px; margin-top: 5px; }
+        input[type="text"] { width: 100%; max-width: 400px; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text-main); }
+        .dir-list { list-style: none; padding: 0; max-width: 600px; }
+        .dir-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; }
+        
     </style>
     <script>
+        function switchTab(event, tabId) {
+            if (event) {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                event.target.classList.add('active');
+            }
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            if(tabId === 'stats') loadStats();
+            if(tabId === 'settings') loadSettings();
+        }
+
         function updateDashboard() {
             fetch('/api/status')
             .then(response => response.json())
             .then(data => {
                 document.getElementById('cpu-stats').innerText = data.cpu_stats;
+                document.getElementById('temp-stats').innerText = data.temp_stats;
                 document.getElementById('ram-stats').innerText = data.ram_stats;
                 
                 const statusCard = document.getElementById('status-card');
@@ -331,15 +410,85 @@ HTML_TEMPLATE = """
                         <td><span class="status-badge ${row[2]}">${row[2]}</span></td>
                         <td style="color: var(--text-sec);">${row[3]}</td>
                         <td style="color: var(--text-sec);">${row[4]}</td>
-                        <td style="font-weight: 500;">${row[5]}</td>
+                        <td style="font-weight: 500; color: var(--acc-green);">${row[5]}</td>
                         <td style="color: var(--text-sec); font-size: 13px;">${row[6]}</td>
                     </tr>`;
                 });
                 document.getElementById('table-body').innerHTML = rowsHtml;
+
+                let drivesHtml = '<h3>Storage Drives</h3><div class="header-cards" style="margin-bottom: 20px;">';
+                data.drives.forEach(drive => {
+                    drivesHtml += `<div class="card" style="min-width: 200px;">
+                        <div class="card-header">
+                            <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
+                            ${drive.mount}
+                        </div>
+                        <div class="card-value" style="font-size: 16px;">Free: ${drive.free}</div>
+                        <div style="color: var(--text-sec); font-size: 13px; margin-top: 5px;">Total: ${drive.total} (${drive.perc} used)</div>
+                    </div>`;
+                });
+                drivesHtml += '</div>';
+                document.getElementById('drives-container').innerHTML = drivesHtml;
             });
         }
         
-        setInterval(updateDashboard, 2000);
+        function loadStats() {
+            fetch('/api/stats')
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('total-saved').innerText = data.total_saved;
+                document.getElementById('total-processed').innerText = data.total_processed;
+                document.getElementById('total-skipped').innerText = data.total_skipped;
+                document.getElementById('total-failed').innerText = data.total_failed;
+            });
+        }
+        
+        function loadSettings() {
+            fetch('/api/settings')
+            .then(res => res.json())
+            .then(data => {
+                const qSlider = document.getElementById('quality-slider');
+                qSlider.value = data.quality === '18' ? 3 : (data.quality === '23' ? 2 : 1);
+                
+                let dirHtml = '';
+                data.directories.forEach(d => {
+                    dirHtml += `<li class="dir-item">
+                        <span>${d.path}</span>
+                        <button onclick="removeDir(${d.id})" class="btn btn-red" style="padding: 6px 12px; font-size: 12px;">Remove</button>
+                    </li>`;
+                });
+                document.getElementById('dir-list').innerHTML = dirHtml;
+            });
+        }
+        
+        function saveQuality() {
+            const val = document.getElementById('quality-slider').value;
+            const q = val == 3 ? '18' : (val == 2 ? '23' : '28');
+            fetch('/api/settings/quality', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({quality: q})
+            });
+        }
+        
+        function addDir(event) {
+            event.preventDefault();
+            const input = document.getElementById('new-dir');
+            fetch('/api/settings/dir', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: input.value})
+            }).then(() => { input.value = ''; loadSettings(); });
+        }
+        
+        function removeDir(id) {
+            fetch('/api/settings/dir/' + id, {method: 'DELETE'})
+            .then(() => loadSettings());
+        }
+        
+        setInterval(() => {
+            if(document.getElementById('dashboard').classList.contains('active')) updateDashboard();
+        }, 2000);
         
         window.onload = function() {
             updateDashboard();
@@ -354,51 +503,114 @@ HTML_TEMPLATE = """
         </h1>
         <p class="subtitle">Hardware accelerated with Intel QSV. Scheduled natively between 01:00 and 07:00.</p>
         
-        <div class="header-cards">
-            <div class="card">
-                <div class="card-header">
-                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
-                    CPU Load
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab(event, 'dashboard')">Dashboard</div>
+            <div class="tab" onclick="switchTab(event, 'stats')">Statistics</div>
+            <div class="tab" onclick="switchTab(event, 'settings')">Settings</div>
+        </div>
+
+        <div id="dashboard" class="tab-content active">
+            <div class="header-cards">
+                <div class="card">
+                    <div class="card-header">
+                        <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect></svg>
+                        CPU Load
+                    </div>
+                    <div id="cpu-stats" class="card-value">-</div>
                 </div>
-                <div id="cpu-stats" class="card-value">-</div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"></path></svg>
+                        CPU Temp
+                    </div>
+                    <div id="temp-stats" class="card-value">-</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="8" x2="20" y2="8"></line><line x1="4" y1="16" x2="20" y2="16"></line><line x1="8" y1="4" x2="8" y2="20"></line><line x1="16" y1="4" x2="16" y2="20"></line></svg>
+                        RAM Usage
+                    </div>
+                    <div id="ram-stats" class="card-value" style="font-size: 16px;">-</div>
+                </div>
+                
+                <div class="card">
+                    <div class="card-header">
+                        <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                        Status
+                    </div>
+                    <div id="status-card" class="card-value">
+                        Idle
+                    </div>
+                </div>
+                
+                <div id="action-card" class="card" style="border:none; box-shadow:none; background:transparent; padding:0; flex: 0.5; justify-content:center; align-items:flex-end;">
+                </div>
             </div>
             
-            <div class="card">
-                <div class="card-header">
-                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="8" x2="20" y2="8"></line><line x1="4" y1="16" x2="20" y2="16"></line><line x1="8" y1="4" x2="8" y2="20"></line><line x1="16" y1="4" x2="16" y2="20"></line></svg>
-                    RAM Usage
+            <div id="drives-container"></div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Filename</th>
+                        <th>Status</th>
+                        <th>Orig. Size</th>
+                        <th>New Size</th>
+                        <th>Saved</th>
+                        <th>Finished</th>
+                    </tr>
+                </thead>
+                <tbody id="table-body">
+                </tbody>
+            </table>
+        </div>
+
+        <div id="stats" class="tab-content">
+            <div class="stats-grid">
+                <div class="card">
+                    <div class="card-header">Total Space Saved</div>
+                    <div id="total-saved" class="card-value" style="color: var(--acc-green);">-</div>
                 </div>
-                <div id="ram-stats" class="card-value" style="font-size: 16px;">-</div>
-            </div>
-            
-            <div class="card">
-                <div class="card-header">
-                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                    Status
+                <div class="card">
+                    <div class="card-header">Files Processed</div>
+                    <div id="total-processed" class="card-value">-</div>
                 </div>
-                <div id="status-card" class="card-value">
-                    Idle
+                <div class="card">
+                    <div class="card-header">Files Skipped</div>
+                    <div id="total-skipped" class="card-value">-</div>
                 </div>
-            </div>
-            
-            <div id="action-card" class="card" style="border:none; box-shadow:none; background:transparent; padding:0; flex: 0.5; justify-content:center; align-items:flex-end;">
+                <div class="card">
+                    <div class="card-header">Failed Conversions</div>
+                    <div id="total-failed" class="card-value" style="color: var(--acc-red);">-</div>
+                </div>
             </div>
         </div>
 
-        <table>
-            <thead>
-                <tr>
-                    <th>Filename</th>
-                    <th>Status</th>
-                    <th>Orig. Size</th>
-                    <th>New Size</th>
-                    <th>Saved</th>
-                    <th>Finished</th>
-                </tr>
-            </thead>
-            <tbody id="table-body">
-            </tbody>
-        </table>
+        <div id="settings" class="tab-content">
+            <div class="card" style="margin-bottom: 20px;">
+                <h3>Transcoding Quality</h3>
+                <div class="form-group">
+                    <label>Quality Setting (FFmpeg -global_quality)</label>
+                    <input type="range" id="quality-slider" min="1" max="3" step="1" onchange="saveQuality()">
+                    <div class="range-labels">
+                        <span>Low/28 (Smaller Size)</span>
+                        <span>Medium/23 (Balanced)</span>
+                        <span>High/18 (Better Video)</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>Monitored Directories</h3>
+                <ul id="dir-list" class="dir-list"></ul>
+                <form onsubmit="addDir(event)" style="display: flex; gap: 10px; margin-top: 15px;">
+                    <input type="text" id="new-dir" placeholder="Absolute directory path..." required>
+                    <button type="submit" class="btn">Add Directory</button>
+                </form>
+            </div>
+        </div>
     </div>
 </body>
 </html>
@@ -410,7 +622,8 @@ def index():
 
 @app.route("/api/status")
 def status_api():
-    cpu, ram = get_sys_stats()
+    cpu, temp, ram = get_sys_stats()
+    drives = get_storage_stats()
     
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -420,35 +633,95 @@ def status_api():
     
     fmt_rows = []
     for r in raw_rows:
+        saved = r[3] - r[4] if r[3] and r[4] else 0
         fmt_rows.append((
             r[0], # id
             r[1], # filename
             r[5], # status
             format_size(r[3]), # old_size
             format_size(r[4]), # new_size
-            format_size(r[3] - r[4]) if r[3] and r[4] else '-', # saved
-            r[8][:16] if r[8] else '-' # finished_at
+            format_size(saved) if saved > 0 else "-", # saved
+            r[8][:16] if r[8] else "-" # finished_at
         ))
         
     return jsonify({
         "cpu_stats": cpu,
+        "temp_stats": temp,
         "ram_stats": ram,
+        "drives": drives,
         "is_scanning": is_scanning,
         "rows": fmt_rows
     })
+
+@app.route("/api/stats")
+def stats_api():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT SUM(old_size_bytes - new_size_bytes) FROM conversions WHERE status='COMPLETED'")
+    saved = c.fetchone()[0] or 0
+    
+    c.execute("SELECT COUNT(*) FROM conversions WHERE status='COMPLETED'")
+    processed = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM conversions WHERE status='SKIPPED'")
+    skipped = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM conversions WHERE status='FAILED'")
+    failed = c.fetchone()[0]
+    
+    conn.close()
+    
+    return jsonify({
+        "total_saved": format_size(saved),
+        "total_processed": processed,
+        "total_skipped": skipped,
+        "total_failed": failed
+    })
+
+@app.route("/api/settings")
+def settings_api():
+    return jsonify(get_settings())
+
+@app.route("/api/settings/quality", methods=["POST"])
+def set_quality():
+    q = request.json.get("quality", "23")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('quality', ?)", (q,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+@app.route("/api/settings/dir", methods=["POST"])
+def add_dir():
+    path = request.json.get("path")
+    if path:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO directories (path) VALUES (?)", (path,))
+        conn.commit()
+        conn.close()
+    return jsonify({"success": True})
+
+@app.route("/api/settings/dir/<int:id>", methods=["DELETE"])
+def remove_dir(id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM directories WHERE id=?", (id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
 
 @app.route("/start_scan", methods=["POST"])
 def manual_start():
     force_scan_event.set()
     time.sleep(1) # short wait to allow state change 
-    return "<script>window.location.href='/';</script>"
+    return redirect("/")
 
 if __name__ == '__main__':
     init_db()
     
-    # Start the background conversion thread
     t = threading.Thread(target=scanner_loop, daemon=True)
     t.start()
     
-    # Start the Flask web dashboard
     app.run(host='0.0.0.0', port=5050)
