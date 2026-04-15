@@ -5,6 +5,7 @@ import sqlite3
 import time
 import threading
 import json
+import re
 from datetime import datetime
 from flask import Flask, render_template_string, jsonify, request, redirect
 
@@ -16,6 +17,9 @@ ALLOWED_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov')
 # Events & state
 force_scan_event = threading.Event()
 is_scanning = False
+current_process = None
+transcode_progress = {}
+cancel_requested = False
 
 def get_sys_stats():
     # RAM calculation
@@ -43,11 +47,26 @@ def get_sys_stats():
     except:
         cpu_str = "N/A"
         
+    # CPU Temp (Try hardware sensors first, fallback to generic thermal zone)
     temp_str = "N/A"
     try:
-        with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
-            temp = float(f.read().strip()) / 1000
-            temp_str = f"{round(temp, 1)}°C"
+        found_temp = False
+        for hwmon in glob.glob('/sys/class/hwmon/hwmon*'):
+            try:
+                with open(os.path.join(hwmon, 'name'), 'r') as f:
+                    if 'coretemp' in f.read():
+                        with open(os.path.join(hwmon, 'temp1_input'), 'r') as f:
+                            temp = float(f.read().strip()) / 1000
+                            temp_str = f"{round(temp, 1)}°C"
+                            found_temp = True
+                        break
+            except:
+                continue
+        
+        if not found_temp:
+            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                temp = float(f.read().strip()) / 1000
+                temp_str = f"{round(temp, 1)}°C"
     except:
         pass
 
@@ -115,7 +134,6 @@ def init_db():
         )
     ''')
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('quality', '23')")
-    # Migrate old hardcoded dirs if empty
     c.execute("SELECT COUNT(*) FROM directories")
     if c.fetchone()[0] == 0:
         for d in ["/home/bennetgriese/plex/media/movies", "/home/bennetgriese/plex/media/tv"]:
@@ -140,6 +158,13 @@ def is_night_time():
     hour = datetime.now().hour
     return 1 <= hour < 7
 
+def get_video_duration(filepath):
+    try:
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", filepath]
+        return float(subprocess.check_output(cmd, text=True).strip())
+    except:
+        return 0.0
+
 def get_video_codec(filepath):
     try:
         cmd = [
@@ -153,6 +178,8 @@ def get_video_codec(filepath):
         return None
 
 def process_file(filepath, quality):
+    global current_process, transcode_progress, cancel_requested
+    
     filename = os.path.basename(filepath)
     try:
         old_size = os.path.getsize(filepath)
@@ -165,9 +192,10 @@ def process_file(filepath, quality):
     c.execute("SELECT status FROM conversions WHERE filepath=?", (filepath,))
     row = c.fetchone()
     
-    if row and row[0] in ('COMPLETED', 'IN_PROGRESS'):
-        conn.close()
-        return
+    if row and row[0] in ('COMPLETED', 'IN_PROGRESS', 'SKIPPED'):
+        if row[0] != 'IN_PROGRESS':
+            conn.close()
+            return
         
     codec = get_video_codec(filepath)
     is_hevc = codec in ('hevc', 'h265')
@@ -190,6 +218,15 @@ def process_file(filepath, quality):
     conn.commit()
     print(f"[{datetime.now()}] Transcoding: {filename}")
     
+    duration = get_video_duration(filepath)
+    transcode_progress = {
+        "filename": filename,
+        "progress": 0,
+        "fps": "-",
+        "speed": "-",
+        "eta": "-"
+    }
+    cancel_requested = False
     tmp_filepath = filepath + ".hevc.tmp.mkv"
     
     cmd = [
@@ -207,8 +244,49 @@ def process_file(filepath, quality):
     ]
     
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0 and os.path.exists(tmp_filepath):
+        current_process = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, universal_newlines=True)
+        time_regex = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})")
+        speed_regex = re.compile(r"speed=\s*([\d\.]*x)")
+        fps_regex = re.compile(r"fps=\s*([\d\.]+)")
+        
+        for line in current_process.stderr:
+            if cancel_requested:
+                current_process.terminate()
+                break
+                
+            t_match = time_regex.search(line)
+            s_match = speed_regex.search(line)
+            f_match = fps_regex.search(line)
+            
+            if t_match:
+                time_str = t_match.group(1)
+                h, m, s = time_str.split(':')
+                parsed_sec = int(h)*3600 + int(m)*60 + float(s)
+                
+                if duration > 0:
+                    pct = (parsed_sec / duration) * 100
+                    transcode_progress["progress"] = min(round(pct, 1), 100)
+                    
+                if s_match:
+                    speed_str = s_match.group(1)
+                    transcode_progress["speed"] = speed_str
+                    try:
+                        speed_val = float(speed_str.replace('x',''))
+                        if speed_val > 0 and duration > 0:
+                            eta_sec = (duration - parsed_sec) / speed_val
+                            transcode_progress["eta"] = f"{int(eta_sec//60)}m {int(eta_sec%60)}s"
+                    except:
+                        pass
+                        
+                if f_match:
+                    transcode_progress["fps"] = f_match.group(1)
+
+        current_process.wait()
+        
+        if cancel_requested:
+            raise Exception("Transcoding was cancelled by user.")
+            
+        if current_process.returncode == 0 and os.path.exists(tmp_filepath):
             new_size = os.path.getsize(tmp_filepath)
             os.remove(filepath)
             final_filepath = os.path.splitext(filepath)[0] + ".mkv"
@@ -221,26 +299,31 @@ def process_file(filepath, quality):
             conn.commit()
             print(f"[{datetime.now()}] Finished: {filename}. Saved {(old_size - new_size)/1024/1024:.2f} MB")
         else:
-            raise Exception(result.stderr[-500:])
+            raise Exception("FFmpeg exited with error code " + str(current_process.returncode))
             
     except Exception as e:
         if os.path.exists(tmp_filepath):
             os.remove(tmp_filepath)
+        status = 'CANCELLED' if cancel_requested else 'FAILED'
         c.execute('''UPDATE conversions 
-                     SET status='FAILED', error_log=?, finished_at=?
+                     SET status=?, error_log=?, finished_at=?
                      WHERE filepath=?''', 
-                  (str(e), datetime.now(), filepath))
+                  (status, str(e), datetime.now(), filepath))
         conn.commit()
-        print(f"[{datetime.now()}] Error transcodoing {filename}: {e}")
+        print(f"[{datetime.now()}] {status} transcoding {filename}: {e}")
         
-    conn.close()
+    finally:
+        current_process = None
+        transcode_progress = {}
+        conn.close()
 
 def scanner_loop():
-    global is_scanning
+    global is_scanning, cancel_requested
     while True:
         if is_night_time() or force_scan_event.is_set():
             is_scanning = True
             force_scan_event.clear()
+            cancel_requested = False
             
             settings = get_settings()
             quality = settings["quality"]
@@ -252,12 +335,15 @@ def scanner_loop():
                     all_files.extend(glob.glob(f"{d}/**/*.*", recursive=True))
             
             for f in all_files:
+                if cancel_requested:
+                    break
                 if f.lower().endswith(ALLOWED_EXTENSIONS):
                     process_file(f, quality)
                     
             is_scanning = False
+            cancel_requested = False
                     
-        force_scan_event.wait(300)
+        time.sleep(10)
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -301,7 +387,7 @@ HTML_TEMPLATE = """
             display: flex;
             justify-content: center;
         }
-        .container { max-width: 1000px; width: 100%; }
+        .container { max-width: 100%; width: 100%; }
         h1 { font-weight: 600; font-size: 28px; margin-bottom: 5px; display: flex; align-items: center; gap: 10px; }
         p.subtitle { color: var(--text-sec); margin-top: 0; margin-bottom: 30px; font-size: 15px; }
         
@@ -325,21 +411,23 @@ HTML_TEMPLATE = """
             gap: 8px;
         }
         .card-header { display: flex; align-items: center; gap: 8px; color: var(--text-sec); font-size: 14px; font-weight: 500;}
-        .card-value { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+        .card-value { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
         
         .btn { 
             background-color: var(--acc-blue); color: white; padding: 10px 20px; border-radius: 20px; border: none; 
             cursor: pointer; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 8px;
-            transition: all 0.2s ease; text-decoration: none;
+            transition: all 0.2s ease; text-decoration: none; justify-content: center;
         }
-        .btn-red { background-color: var(--acc-red); }
+        .btn-red { background-color: rgba(255, 59, 48, 0.15); color: var(--acc-red); }
+        .btn-red:hover { background-color: rgba(255, 59, 48, 0.25); }
         .btn:hover { opacity: 0.9; transform: scale(0.98); }
         .btn-disabled { background-color: var(--border); color: var(--text-sec); cursor: not-allowed; }
         
         .sp { animation: spin 2s linear infinite; }
         @keyframes spin { 100% { transform: rotate(360deg); } }
         
-        table { width: 100%; border-collapse: collapse; background-color: var(--card-bg); border-radius: 14px; overflow: hidden; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.02); }
+        .table-responsive { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 14px; box-shadow: 0 4px 6px rgba(0,0,0,0.02); border: 1px solid var(--border); background-color: var(--card-bg); }
+        table { width: 100%; min-width: 600px; border-collapse: collapse; }
         th, td { padding: 14px 16px; text-align: left; font-size: 14px; border-bottom: 1px solid var(--border); }
         th { color: var(--text-sec); font-weight: 500; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
         tr:last-child td { border-bottom: none; }
@@ -347,17 +435,15 @@ HTML_TEMPLATE = """
         .status-badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
         .COMPLETED { background-color: rgba(52, 199, 89, 0.15); color: var(--acc-green); }
         .FAILED { background-color: rgba(255, 59, 48, 0.15); color: var(--acc-red); }
+        .CANCELLED { background-color: rgba(255, 59, 48, 0.15); color: var(--acc-red); }
         .IN_PROGRESS { background-color: rgba(255, 204, 0, 0.15); color: var(--acc-yellow); }
         .SKIPPED { background-color: rgba(142, 142, 147, 0.15); color: var(--text-sec); }
         
         .icon { width: 20px; height: 20px; display: block; }
-        .icon-sm { width: 16px; height: 16px; display: block; }
+        .icon-sm { width: 16px; height: 16px; display: block; min-width: 16px;}
         .icon-lg { width: 28px; height: 28px; display: block; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1)); }
         
-        /* Stats Tab Specifics */
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
-        
-        /* Settings Tab Specifics */
         .form-group { margin-bottom: 20px; }
         label { display: block; font-weight: 600; margin-bottom: 8px; }
         input[type="range"] { width: 100%; max-width: 400px; accent-color: var(--acc-blue); }
@@ -379,6 +465,12 @@ HTML_TEMPLATE = """
             if(tabId === 'settings') loadSettings();
         }
 
+        function cancelScan() {
+            if(confirm("Cancel the current transcoding job? The original file will be safely kept and the temporary file deleted.")) {
+                fetch('/api/cancel', { method: 'POST' }).then(() => updateDashboard());
+            }
+        }
+
         function updateDashboard() {
             fetch('/api/status')
             .then(response => response.json())
@@ -391,14 +483,33 @@ HTML_TEMPLATE = """
                 const actionCard = document.getElementById('action-card');
                 
                 if (data.is_scanning) {
-                    statusCard.innerHTML = `<svg class="icon-sm sp" style="color: var(--acc-blue);" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="4.93" x2="19.07" y2="7.76"></line></svg> Working`;
+                    let progHtml = '';
+                    if(data.progress && data.progress.filename) {
+                        progHtml = `
+                        <div style="width: 100%; margin-top: 10px; font-size: 13px;">
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                                <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%;">${data.progress.filename}</span>
+                                <span style="font-weight: 600; color: var(--acc-blue);">${data.progress.progress}%</span>
+                            </div>
+                            <div style="width: 100%; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;">
+                                <div style="width: ${data.progress.progress}%; height: 100%; background: var(--acc-blue); transition: width 0.3s;"></div>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin-top: 4px; color: var(--text-sec); font-size: 11px;">
+                                <span>Speed: ${data.progress.speed} | FPS: ${data.progress.fps}</span>
+                                <span>ETA: ${data.progress.eta}</span>
+                            </div>
+                        </div>`;
+                    }
+
+                    statusCard.innerHTML = `<svg class="icon-sm sp" style="color: var(--acc-blue); margin-right: 8px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="4.93" x2="19.07" y2="7.76"></line></svg> Working${progHtml}`;
                     
-                    actionCard.innerHTML = `<button class="btn btn-disabled" disabled>
-                        <svg class="icon sp" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="4.93" x2="19.07" y2="7.76"></line></svg> Progress</button>`;
+                    actionCard.innerHTML = `<button class="btn btn-red" onclick="cancelScan()" style="width: 100%;">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                        Cancel Job</button>`;
                 } else {
                     statusCard.innerHTML = "Idle";
-                    actionCard.innerHTML = `<form action="/start_scan" method="POST" style="margin:0;">
-                        <button class="btn" id="start-btn" type="submit">
+                    actionCard.innerHTML = `<form action="/start_scan" method="POST" style="margin:0; width: 100%;">
+                        <button class="btn" id="start-btn" type="submit" style="width: 100%;">
                         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
                         Start Scan</button></form>`;
                 }
@@ -454,7 +565,7 @@ HTML_TEMPLATE = """
                 data.directories.forEach(d => {
                     dirHtml += `<li class="dir-item">
                         <span>${d.path}</span>
-                        <button onclick="removeDir(${d.id})" class="btn btn-red" style="padding: 6px 12px; font-size: 12px;">Remove</button>
+                        <button onclick="removeDir(${d.id})" class="btn btn-red" style="padding: 6px 12px; font-size: 12px; background: var(--acc-red); color: white;">Remove</button>
                     </li>`;
                 });
                 document.getElementById('dir-list').innerHTML = dirHtml;
@@ -476,7 +587,6 @@ HTML_TEMPLATE = """
             const drop = document.getElementById('dir-suggestions');
             let val = input.value;
             
-            // Default to root if empty, so it displays something initially
             if (val.length === 0) val = '/';
             
             fetch('/api/suggest_dir?path=' + encodeURIComponent(val))
@@ -507,7 +617,7 @@ HTML_TEMPLATE = """
             input.value = path + '/';
             document.getElementById('dir-suggestions').style.display = 'none';
             input.focus();
-            suggestDir(); // fetch next level immediately
+            suggestDir(); 
         }
 
         document.addEventListener('click', function(e) {
@@ -538,7 +648,7 @@ HTML_TEMPLATE = """
         
         setInterval(() => {
             if(document.getElementById('dashboard').classList.contains('active')) updateDashboard();
-        }, 2000);
+        }, 1500);
         
         window.onload = function() {
             updateDashboard();
@@ -572,7 +682,7 @@ HTML_TEMPLATE = """
                 <div class="card">
                     <div class="card-header">
                         <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"></path></svg>
-                        CPU Temp
+                        CPU Temp (Core)
                     </div>
                     <div id="temp-stats" class="card-value">-</div>
                 </div>
@@ -585,36 +695,38 @@ HTML_TEMPLATE = """
                     <div id="ram-stats" class="card-value" style="font-size: 16px;">-</div>
                 </div>
                 
-                <div class="card">
+                <div class="card" style="flex: 2; min-width: 300px;">
                     <div class="card-header">
                         <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                        Status
+                        Current Job Status
                     </div>
-                    <div id="status-card" class="card-value">
+                    <div id="status-card" class="card-value" style="font-size: 15px; font-weight: normal; align-items: flex-start; flex-direction: column; width: 100%;">
                         Idle
                     </div>
                 </div>
                 
-                <div id="action-card" class="card" style="border:none; box-shadow:none; background:transparent; padding:0; flex: 0.5; justify-content:center; align-items:flex-end;">
+                <div id="action-card" style="display: flex; align-items: flex-end; padding-bottom: 20px; flex: 0.5;">
                 </div>
             </div>
             
             <div id="drives-container"></div>
 
-            <table>
-                <thead>
-                    <tr>
-                        <th>Filename</th>
-                        <th>Status</th>
-                        <th>Orig. Size</th>
-                        <th>New Size</th>
-                        <th>Saved</th>
-                        <th>Finished</th>
-                    </tr>
-                </thead>
-                <tbody id="table-body">
-                </tbody>
-            </table>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Filename</th>
+                            <th>Status</th>
+                            <th>Orig. Size</th>
+                            <th>New Size</th>
+                            <th>Saved</th>
+                            <th>Finished</th>
+                        </tr>
+                    </thead>
+                    <tbody id="table-body">
+                    </tbody>
+                </table>
+            </div>
         </div>
 
         <div id="stats" class="tab-content">
@@ -690,13 +802,13 @@ def status_api():
     for r in raw_rows:
         saved = r[3] - r[4] if r[3] and r[4] else 0
         fmt_rows.append((
-            r[0], # id
-            r[1], # filename
-            r[5], # status
-            format_size(r[3]), # old_size
-            format_size(r[4]), # new_size
-            format_size(saved) if saved > 0 else "-", # saved
-            r[8][:16] if r[8] else "-" # finished_at
+            r[0],
+            r[1],
+            r[5],
+            format_size(r[3]),
+            format_size(r[4]),
+            format_size(saved) if saved > 0 else "-",
+            r[8][:16] if r[8] else "-"
         ))
         
     return jsonify({
@@ -705,6 +817,7 @@ def status_api():
         "ram_stats": ram,
         "drives": drives,
         "is_scanning": is_scanning,
+        "progress": transcode_progress if is_scanning else {},
         "rows": fmt_rows
     })
 
@@ -732,6 +845,15 @@ def stats_api():
         "total_skipped": skipped,
         "total_failed": failed
     })
+
+@app.route("/api/cancel", methods=["POST"])
+def cancel_scan():
+    global cancel_requested, current_process
+    if is_scanning:
+        cancel_requested = True
+        if current_process:
+            current_process.terminate()
+    return jsonify({"success": True})
 
 @app.route("/api/settings")
 def settings_api():
@@ -791,7 +913,6 @@ def suggest_dir():
     folders = []
     for item in sorted(items):
         item_path = os.path.join(base_dir, item)
-        # Show all directories, no matter if they are hidden (start with .)
         if os.path.isdir(item_path) and item.lower().startswith(prefix.lower()):
             folders.append({"name": item, "path": item_path})
 
@@ -800,7 +921,7 @@ def suggest_dir():
 @app.route("/start_scan", methods=["POST"])
 def manual_start():
     force_scan_event.set()
-    time.sleep(1) # short wait to allow state change 
+    time.sleep(1) 
     return redirect("/")
 
 if __name__ == '__main__':
