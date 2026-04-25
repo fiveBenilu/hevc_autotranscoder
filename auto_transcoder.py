@@ -358,11 +358,15 @@ HTML_TEMPLATE = """
             --card-bg: #ffffff;
             --text-main: #1d1d1f;
             --text-sec: #86868b;
-            --border: #e5e5ea;
+            --border: rgba(60,60,67,0.1);
             --acc-blue: #007aff;
             --acc-green: #34c759;
             --acc-red: #ff3b30;
             --acc-yellow: #ffcc00;
+            --control-bg: #e3e3e8;
+            --control-active: #ffffff;
+            --shadow-sm: 0 4px 14px rgba(0,0,0,0.03);
+            --shadow-md: 0 1px 3px rgba(0,0,0,0.1);
         }
         @media (prefers-color-scheme: dark) {
             :root {
@@ -370,64 +374,89 @@ HTML_TEMPLATE = """
                 --card-bg: #1c1c1e;
                 --text-main: #f2f2f7;
                 --text-sec: #aeaeb2;
-                --border: #38383a;
+                --border: rgba(84,84,88,0.65);
                 --acc-blue: #0a84ff;
                 --acc-green: #32d74b;
                 --acc-red: #ff453a;
                 --acc-yellow: #ffd60a;
+                --control-bg: #2c2c2e;
+                --control-active: #636366;
+                --shadow-sm: 0 4px 14px rgba(0,0,0,0.4);
+                --shadow-md: 0 1px 3px rgba(0,0,0,0.3);
             }
         }
-        * { box-sizing: border-box; }
+        * { box-sizing: border-box; -webkit-font-smoothing: antialiased; }
         body { 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
             background-color: var(--bg-color); 
             color: var(--text-main); 
-            padding: 40px 20px; 
+            padding: 0; 
             margin: 0; 
+        }
+        .navbar {
+            background-color: rgba(255, 255, 255, 0.7);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border);
+            padding: 12px 20px;
+            position: sticky;
+            top: 0;
+            z-index: 50;
             display: flex;
             justify-content: center;
         }
-        .container { max-width: 100%; width: 100%; }
-        h1 { font-weight: 600; font-size: 28px; margin-bottom: 5px; display: flex; align-items: center; gap: 10px; }
-        p.subtitle { color: var(--text-sec); margin-top: 0; margin-bottom: 30px; font-size: 15px; }
+        @media (prefers-color-scheme: dark) {
+            .navbar { background-color: rgba(28, 28, 30, 0.7); }
+        }
+        .nav-content { max-width: 1100px; width: 100%; display: flex; justify-content: space-between; align-items: center; }
+        .nav-title { font-weight: 600; font-size: 18px; display: flex; align-items: center; gap: 8px; letter-spacing: -0.3px;}
         
-        .tabs { display: flex; gap: 15px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 10px;}
-        .tab { cursor: pointer; font-size: 16px; font-weight: 600; color: var(--text-sec); padding: 5px 10px; }
-        .tab.active { color: var(--acc-blue); border-bottom: 2px solid var(--acc-blue); }
-        .tab-content { display: none; }
+        .container { max-width: 1100px; width: 100%; margin: 40px auto; padding: 0 20px; }
+        
+        h1 { font-weight: 700; font-size: 34px; margin-bottom: 8px; letter-spacing: -0.5px; }
+        p.subtitle { color: var(--text-sec); margin-top: 0; margin-bottom: 30px; font-size: 16px; font-weight: 400; }
+        
+        /* Apple Segmented Control */
+        .segmented-control { display: inline-flex; background: var(--control-bg); border-radius: 9px; padding: 2px; margin-bottom: 30px; }
+        .tab { cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text-main); padding: 6px 18px; border-radius: 7px; transition: all 0.2s ease; }
+        .tab.active { background: var(--control-active); box-shadow: var(--shadow-md); }
+        .tab-content { display: none; animation: fadeIn 0.3s ease; }
         .tab-content.active { display: block; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
 
-        .header-cards { display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap; }
+        .header-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 30px; }
         .card { 
             background-color: var(--card-bg); 
-            border: 1px solid var(--border); 
-            border-radius: 14px; 
-            padding: 20px; 
-            flex: 1; 
-            min-width: 180px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.02);
+            border-radius: 18px; 
+            padding: 24px; 
+            box-shadow: var(--shadow-sm);
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 12px;
+            position: relative;
+            overflow: hidden;
         }
-        .card-header { display: flex; align-items: center; gap: 8px; color: var(--text-sec); font-size: 14px; font-weight: 500;}
-        .card-value { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .card-header { display: flex; align-items: center; gap: 8px; color: var(--text-sec); font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;}
+        .card-value { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
         
         .btn { 
-            background-color: var(--acc-blue); color: white; padding: 10px 20px; border-radius: 20px; border: none; 
-            cursor: pointer; font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 8px;
+            background-color: var(--acc-blue); color: white; padding: 12px 20px; border-radius: 20px; border: none; 
+            cursor: pointer; font-size: 15px; font-weight: 600; display: inline-flex; align-items: center; gap: 8px;
             transition: all 0.2s ease; text-decoration: none; justify-content: center;
         }
-        .btn-red { background-color: rgba(255, 59, 48, 0.15); color: var(--acc-red); }
-        .btn-red:hover { background-color: rgba(255, 59, 48, 0.25); }
+        .btn-red { background-color: var(--acc-red); color: white; }
         .btn:hover { opacity: 0.9; transform: scale(0.98); }
-        .btn-disabled { background-color: var(--border); color: var(--text-sec); cursor: not-allowed; }
         
         .sp { animation: spin 2s linear infinite; }
         @keyframes spin { 100% { transform: rotate(360deg); } }
         
-        .table-responsive { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 14px; box-shadow: 0 4px 6px rgba(0,0,0,0.02); border: 1px solid var(--border); background-color: var(--card-bg); }
-        table { width: 100%; min-width: 600px; border-collapse: collapse; }
+        /* List Style UI */
+        .list-card { background: var(--card-bg); border-radius: 18px; box-shadow: var(--shadow-sm); overflow: hidden; margin-bottom: 30px; padding: 0;}
+        .list-header { padding: 16px 20px; border-bottom: 1px solid var(--border); background: rgba(0,0,0,0.01); display: flex; justify-content: space-between; align-items: center; }
+        .list-title { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
+        
+        .table-responsive { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+        table { width: 100%; border-collapse: collapse; background-color: var(--card-bg); border-radius: 14px; overflow: hidden; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.02); }
         th, td { padding: 14px 16px; text-align: left; font-size: 14px; border-bottom: 1px solid var(--border); }
         th { color: var(--text-sec); font-weight: 500; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
         tr:last-child td { border-bottom: none; }
@@ -439,19 +468,46 @@ HTML_TEMPLATE = """
         .IN_PROGRESS { background-color: rgba(255, 204, 0, 0.15); color: var(--acc-yellow); }
         .SKIPPED { background-color: rgba(142, 142, 147, 0.15); color: var(--text-sec); }
         
-        .icon { width: 20px; height: 20px; display: block; }
+        .icon { width: 18px; height: 18px; display: block; }
         .icon-sm { width: 16px; height: 16px; display: block; min-width: 16px;}
-        .icon-lg { width: 28px; height: 28px; display: block; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1)); }
+        .icon-lg { width: 28px; height: 28px; display: block; margin-right: 6px; color: var(--acc-blue); }
         
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
-        .form-group { margin-bottom: 20px; }
-        label { display: block; font-weight: 600; margin-bottom: 8px; }
+        .form-group { margin-bottom: 20px; padding: 0 20px;}
+        label { display: block; font-weight: 500; margin-bottom: 12px; font-size: 14px;}
         input[type="range"] { width: 100%; max-width: 400px; accent-color: var(--acc-blue); }
-        .range-labels { display: flex; justify-content: space-between; max-width: 400px; color: var(--text-sec); font-size: 13px; margin-top: 5px; }
-        input[type="text"] { width: 100%; max-width: 400px; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text-main); }
-        .dir-list { list-style: none; padding: 0; max-width: 600px; }
-        .dir-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; }
+        .range-labels { display: flex; justify-content: space-between; max-width: 400px; color: var(--text-sec); font-size: 12px; margin-top: 8px; font-weight: 500; }
+        input[type="text"] { width: 100%; max-width: 400px; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--border); background: transparent; color: var(--text-main); font-size: 15px;}
+        input[type="text"]:focus { outline: none; border-color: var(--acc-blue); box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.2); }
         
+        .dir-list { list-style: none; padding: 0; margin: 0; }
+        .dir-item { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--border); }
+        .dir-item:last-child { border-bottom: none; }
+        .dir-path { font-size: 15px; font-weight: 500; }
+        
+        /* Grid Layout for specific layout scenarios */
+        .layout-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; align-items: stretch;}
+        @media (max-width: 900px) {
+            .layout-grid { grid-template-columns: 1fr; gap: 16px; }
+            .container { margin: 20px auto; padding: 0 16px; }
+            h1 { font-size: 28px; }
+            .btn { width: 100%; justify-content: center; }
+            #action-card { padding: 16px 0 !important; align-items: stretch !important; flex: none !important; }
+            .card { padding: 20px; }
+            .card-value { font-size: 24px !important; }
+            
+            /* Responsive Table -> Cards for Mobile */
+            .table-responsive { background: transparent; border: none; box-shadow: none; overflow: visible; }
+            table { border: none; background: transparent; box-shadow: none; display: block; border-radius: 0; }
+            thead { display: none; }
+            tbody { display: flex; flex-direction: column; gap: 12px; }
+            tr.table-row-card { display: flex; flex-direction: column; background: var(--card-bg); border-radius: 16px; padding: 16px; border: 1px solid var(--border); box-shadow: var(--shadow-sm); position: relative; }
+            tr.table-row-card td { display: flex; justify-content: space-between; align-items: center; border: none; padding: 6px 0; font-size: 14px; white-space: normal; line-height: 1.4; }
+            tr.table-row-card td::before { content: attr(data-label); font-size: 12px; font-weight: 500; color: var(--text-sec); text-transform: uppercase; letter-spacing: 0.5px; width: 40%; flex-shrink: 0; }
+            tr.table-row-card td.td-filename { font-weight: 600 !important; font-size: 15px; margin-bottom: 8px; flex-direction: column; align-items: flex-start; padding-bottom: 8px; padding-right: 105px; border-bottom: 1px solid var(--border); word-break: break-all; }
+            tr.table-row-card td.td-filename::before { display: none; }
+            tr.table-row-card td.td-status { position: absolute; top: 12px; right: 16px; padding: 0; }
+            tr.table-row-card td.td-status::before { display: none; }
+        }
     </style>
     <script>
         function switchTab(event, tabId) {
@@ -486,56 +542,57 @@ HTML_TEMPLATE = """
                     let progHtml = '';
                     if(data.progress && data.progress.filename) {
                         progHtml = `
-                        <div style="width: 100%; margin-top: 10px; font-size: 13px;">
-                            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-                                <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%;">${data.progress.filename}</span>
-                                <span style="font-weight: 600; color: var(--acc-blue);">${data.progress.progress}%</span>
+                        <div style="width: 100%; margin-top: 15px; font-size: 14px;">
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                                <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%; font-weight: 500;">${data.progress.filename}</span>
+                                <span style="font-weight: 700; color: var(--acc-blue);">${data.progress.progress}%</span>
                             </div>
-                            <div style="width: 100%; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;">
-                                <div style="width: ${data.progress.progress}%; height: 100%; background: var(--acc-blue); transition: width 0.3s;"></div>
+                            <div style="width: 100%; height: 8px; background: var(--control-bg); border-radius: 4px; overflow: hidden;">
+                                <div style="width: ${data.progress.progress}%; height: 100%; background: var(--acc-blue); transition: width 0.4s ease-out;"></div>
                             </div>
-                            <div style="display: flex; justify-content: space-between; margin-top: 4px; color: var(--text-sec); font-size: 11px;">
-                                <span>Speed: ${data.progress.speed} | FPS: ${data.progress.fps}</span>
+                            <div style="display: flex; justify-content: space-between; margin-top: 8px; color: var(--text-sec); font-size: 13px; font-weight: 500;">
+                                <span>Speed: ${data.progress.speed} &bull; FPS: ${data.progress.fps}</span>
                                 <span>ETA: ${data.progress.eta}</span>
                             </div>
                         </div>`;
                     }
 
-                    statusCard.innerHTML = `<svg class="icon-sm sp" style="color: var(--acc-blue); margin-right: 8px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="4.93" x2="19.07" y2="7.76"></line></svg> Working${progHtml}`;
+                    statusCard.innerHTML = `<span style="display:flex; align-items:center; gap:8px;"><svg class="icon-sm sp" style="color: var(--acc-blue);" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="4.93" x2="19.07" y2="7.76"></line></svg> Transcoding...</span>${progHtml}`;
                     
                     actionCard.innerHTML = `<button class="btn btn-red" onclick="cancelScan()" style="width: 100%;">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
                         Cancel Job</button>`;
                 } else {
                     statusCard.innerHTML = "Idle";
                     actionCard.innerHTML = `<form action="/start_scan" method="POST" style="margin:0; width: 100%;">
                         <button class="btn" id="start-btn" type="submit" style="width: 100%;">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
                         Start Scan</button></form>`;
                 }
 
                 let rowsHtml = '';
                 data.rows.forEach(row => {
-                    rowsHtml += `<tr>
-                        <td style="font-weight: 500;">${row[1]}</td>
-                        <td><span class="status-badge ${row[2]}">${row[2]}</span></td>
-                        <td style="color: var(--text-sec);">${row[3]}</td>
-                        <td style="color: var(--text-sec);">${row[4]}</td>
-                        <td style="font-weight: 500; color: var(--acc-green);">${row[5]}</td>
-                        <td style="color: var(--text-sec); font-size: 13px;">${row[6]}</td>
+                    let fileName = row[1];
+                    rowsHtml += `<tr class="table-row-card">
+                        <td data-label="Filename" class="td-filename" style="font-weight: 500;">${fileName}</td>
+                        <td data-label="Status" class="td-status"><span class="status-badge ${row[2]}">${row[2]}</span></td>
+                        <td data-label="Orig. Size" style="color: var(--text-sec);">${row[3]}</td>
+                        <td data-label="New Size" style="color: var(--text-sec);">${row[4]}</td>
+                        <td data-label="Saved" style="font-weight: 600; color: var(--acc-green);">${row[5]}</td>
+                        <td data-label="Finished" style="color: var(--text-sec);">${row[6]}</td>
                     </tr>`;
                 });
                 document.getElementById('table-body').innerHTML = rowsHtml;
 
-                let drivesHtml = '<h3>Storage Drives</h3><div class="header-cards" style="margin-bottom: 20px;">';
+                let drivesHtml = '<div class="header-cards" style="margin-bottom: 24px;">';
                 data.drives.forEach(drive => {
-                    drivesHtml += `<div class="card" style="min-width: 200px;">
+                    drivesHtml += `<div class="card">
                         <div class="card-header">
-                            <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
+                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6" y2="6"></line><line x1="6" y1="18" x2="6" y2="18"></line></svg>
                             ${drive.mount}
                         </div>
-                        <div class="card-value" style="font-size: 16px;">Free: ${drive.free}</div>
-                        <div style="color: var(--text-sec); font-size: 13px; margin-top: 5px;">Total: ${drive.total} (${drive.perc} used)</div>
+                        <div class="card-value" style="font-size: 24px;">${drive.free} free</div>
+                        <div style="color: var(--text-sec); font-size: 13px; font-weight: 500; margin-top: 4px;">Total: ${drive.total} &bull; ${drive.perc} used</div>
                     </div>`;
                 });
                 drivesHtml += '</div>';
@@ -564,8 +621,8 @@ HTML_TEMPLATE = """
                 let dirHtml = '';
                 data.directories.forEach(d => {
                     dirHtml += `<li class="dir-item">
-                        <span>${d.path}</span>
-                        <button onclick="removeDir(${d.id})" class="btn btn-red" style="padding: 6px 12px; font-size: 12px; background: var(--acc-red); color: white;">Remove</button>
+                        <span class="dir-path">${d.path}</span>
+                        <button onclick="removeDir(${d.id})" class="btn btn-red" style="padding: 6px 14px; font-size: 13px; background: rgba(255, 59, 48, 0.15); color: var(--acc-red);">Remove</button>
                     </li>`;
                 });
                 document.getElementById('dir-list').innerHTML = dirHtml;
@@ -595,11 +652,11 @@ HTML_TEMPLATE = """
                 if (data.folders && data.folders.length > 0) {
                     drop.innerHTML = data.folders.map(f => {
                         const safePath = f.path.replace(/"/g, '&quot;');
-                        return `<div style="padding: 10px 12px; cursor: pointer; border-bottom: 1px solid var(--border); display: flex; align-items: center;" 
+                        return `<div style="padding: 12px 16px; cursor: pointer; border-bottom: 1px solid var(--border); display: flex; align-items: center; font-size: 14px;" 
                                       onclick="selectDir(event, this.dataset.path)" data-path="${safePath}"
                                       onmouseover="this.style.background='var(--bg-color)'"
                                       onmouseout="this.style.background='transparent'">
-                                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="var(--acc-blue)" stroke-width="2" style="margin-right: 8px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="var(--acc-blue)" stroke-width="2" style="margin-right: 12px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
                                     ${f.name}
                                  </div>`;
                     }).join('');
@@ -656,56 +713,64 @@ HTML_TEMPLATE = """
     </script>
 </head>
 <body>
-    <div class="container">
-        <h1>
-            <svg class="icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
-            HEVC Transcoder
-        </h1>
-        <p class="subtitle">Hardware accelerated with Intel QSV. Scheduled natively between 01:00 and 07:00.</p>
-        
-        <div class="tabs">
-            <div class="tab active" onclick="switchTab(event, 'dashboard')">Dashboard</div>
-            <div class="tab" onclick="switchTab(event, 'stats')">Statistics</div>
-            <div class="tab" onclick="switchTab(event, 'settings')">Settings</div>
+    <div class="navbar">
+        <div class="nav-content">
+            <span class="nav-title">
+                <svg class="icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
+                Transcoder
+            </span>
+            <div class="segmented-control" style="margin-bottom:0;">
+                <div class="tab active" onclick="switchTab(event, 'dashboard')">Dashboard</div>
+                <div class="tab" onclick="switchTab(event, 'stats')">Statistics</div>
+                <div class="tab" onclick="switchTab(event, 'settings')">Settings</div>
+            </div>
         </div>
+    </div>
+
+    <div class="container">
+        <h1>Overview</h1>
+        <p class="subtitle">Hardware accelerated with Intel QSV. Automatically runs between 01:00 and 07:00.</p>
 
         <div id="dashboard" class="tab-content active">
-            <div class="header-cards">
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect></svg>
-                        CPU Load
-                    </div>
-                    <div id="cpu-stats" class="card-value">-</div>
-                </div>
+            <div class="layout-grid">
+                <div>
+                    <div class="header-cards">
+                        <div class="card">
+                            <div class="card-header">
+                                <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect></svg>
+                                CPU Load
+                            </div>
+                            <div id="cpu-stats" class="card-value">-</div>
+                        </div>
 
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"></path></svg>
-                        CPU Temp (Core)
+                        <div class="card">
+                            <div class="card-header">
+                                <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"></path></svg>
+                                CPU Temp
+                            </div>
+                            <div id="temp-stats" class="card-value">-</div>
+                        </div>
+                        
+                        <div class="card" style="grid-column: 1 / -1;">
+                            <div class="card-header">
+                                <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="4" y1="8" x2="20" y2="8"></line><line x1="4" y1="16" x2="20" y2="16"></line><line x1="8" y1="4" x2="8" y2="20"></line><line x1="16" y1="4" x2="16" y2="20"></line></svg>
+                                Memory Usage
+                            </div>
+                            <div id="ram-stats" class="card-value" style="font-size: 20px;">-</div>
+                        </div>
+                        
+                        <div class="card" style="grid-column: 1 / -1;">
+                            <div class="card-header">
+                                <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                                Current Job Status
+                            </div>
+                            <div id="status-card" class="card-value" style="font-size: 22px; align-items: flex-start; flex-direction: column; width: 100%;">
+                                Idle
+                            </div>
+                        </div>
                     </div>
-                    <div id="temp-stats" class="card-value">-</div>
                 </div>
-                
-                <div class="card">
-                    <div class="card-header">
-                        <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="8" x2="20" y2="8"></line><line x1="4" y1="16" x2="20" y2="16"></line><line x1="8" y1="4" x2="8" y2="20"></line><line x1="16" y1="4" x2="16" y2="20"></line></svg>
-                        RAM Usage
-                    </div>
-                    <div id="ram-stats" class="card-value" style="font-size: 16px;">-</div>
-                </div>
-                
-                <div class="card" style="flex: 2; min-width: 300px;">
-                    <div class="card-header">
-                        <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                        Current Job Status
-                    </div>
-                    <div id="status-card" class="card-value" style="font-size: 15px; font-weight: normal; align-items: flex-start; flex-direction: column; width: 100%;">
-                        Idle
-                    </div>
-                </div>
-                
-                <div id="action-card" style="display: flex; align-items: flex-end; padding-bottom: 20px; flex: 0.5;">
+                <div id="action-card" class="card" style="border:none; box-shadow:none; background:transparent; padding:0; flex: 0.5; justify-content:center; align-items:flex-end;">
                 </div>
             </div>
             
@@ -730,52 +795,61 @@ HTML_TEMPLATE = """
         </div>
 
         <div id="stats" class="tab-content">
-            <div class="stats-grid">
+            <div class="header-cards">
                 <div class="card">
                     <div class="card-header">Total Space Saved</div>
-                    <div id="total-saved" class="card-value" style="color: var(--acc-green);">-</div>
+                    <div id="total-saved" class="card-value" style="color: var(--acc-green); font-size: 32px;">-</div>
                 </div>
                 <div class="card">
                     <div class="card-header">Files Processed</div>
-                    <div id="total-processed" class="card-value">-</div>
+                    <div id="total-processed" class="card-value" style="font-size: 32px;">-</div>
                 </div>
                 <div class="card">
                     <div class="card-header">Files Skipped</div>
-                    <div id="total-skipped" class="card-value">-</div>
+                    <div id="total-skipped" class="card-value" style="font-size: 32px;">-</div>
                 </div>
                 <div class="card">
                     <div class="card-header">Failed Conversions</div>
-                    <div id="total-failed" class="card-value" style="color: var(--acc-red);">-</div>
+                    <div id="total-failed" class="card-value" style="color: var(--acc-red); font-size: 32px;">-</div>
                 </div>
             </div>
         </div>
 
         <div id="settings" class="tab-content">
-            <div class="card" style="margin-bottom: 20px;">
-                <h3>Transcoding Quality</h3>
-                <div class="form-group">
-                    <label>Quality Setting (FFmpeg -global_quality)</label>
-                    <input type="range" id="quality-slider" min="1" max="3" step="1" onchange="saveQuality()">
-                    <div class="range-labels">
-                        <span>Low/28 (Smaller Size)</span>
-                        <span>Medium/23 (Balanced)</span>
-                        <span>High/18 (Better Video)</span>
+            <div class="list-card">
+                <div class="list-header">
+                    <span class="list-title">Transcoding Quality</span>
+                </div>
+                <div style="padding: 20px 0;">
+                    <div class="form-group">
+                        <label>Quality Setting (FFmpeg -global_quality)</label>
+                        <input type="range" id="quality-slider" min="1" max="3" step="1" onchange="saveQuality()">
+                        <div class="range-labels">
+                            <span>Low/28 (Smaller Size)</span>
+                            <span>Medium/23 (Balanced)</span>
+                            <span>High/18 (Better Video)</span>
+                        </div>
                     </div>
                 </div>
             </div>
             
-            <div class="card">
-                <h3>Monitored Directories</h3>
+            <div class="list-card">
+                <div class="list-header">
+                    <span class="list-title">Monitored Directories</span>
+                </div>
                 <ul id="dir-list" class="dir-list"></ul>
-                <form onsubmit="addDir(event)" style="margin-top: 15px;">
-                    <div style="display: flex; gap: 10px; position: relative;">
-                        <div style="flex: 1; position: relative;">
-                            <input type="text" id="new-dir" style="width: 100%; box-sizing: border-box;" placeholder="Type /home/... to browse" oninput="suggestDir()" onclick="suggestDir()" autocomplete="off" required>
-                            <div id="dir-suggestions" style="display: none; position: absolute; width: 100%; top: calc(100% + 5px); background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; max-height: 250px; overflow-y: auto; box-shadow: 0 4px 12px rgba(0,0,0,0.15); z-index: 100;"></div>
+                <div style="padding: 20px; border-top: 1px solid var(--border); background: rgba(0,0,0,0.01);">
+                    <form onsubmit="addDir(event)" style="margin: 0;">
+                        <label>Add new directory</label>
+                        <div style="display: flex; gap: 12px; position: relative;">
+                            <div style="flex: 1; position: relative;">
+                                <input type="text" id="new-dir" style="width: 100%; box-sizing: border-box;" placeholder="Type /home/... to browse" oninput="suggestDir()" onclick="suggestDir()" autocomplete="off" required>
+                                <div id="dir-suggestions" style="display: none; position: absolute; width: 100%; top: calc(100% + 8px); background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; max-height: 250px; overflow-y: auto; box-shadow: 0 10px 30px rgba(0,0,0,0.15); z-index: 100;"></div>
+                            </div>
+                            <button type="submit" class="btn">Add Directory</button>
                         </div>
-                        <button type="submit" class="btn">Add Directory</button>
-                    </div>
-                </form>
+                    </form>
+                </div>
             </div>
         </div>
     </div>
