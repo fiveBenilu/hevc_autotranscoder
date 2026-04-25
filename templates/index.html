@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plex Transcoder</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script defer src="/static/app.js"></script>
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="sidebar-header">
+            <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polygon points="23 7 16 12 23 17 23 7"></polygon>
+                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+            </svg>
+            <h1 class="sidebar-title">Transcoder</h1>
+        </div>
+        
+        <div class="nav-tabs">
+            <button class="nav-tab active" onclick="switchTab(event, 'dashboard')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="7" height="7"></rect>
+                    <rect x="14" y="3" width="7" height="7"></rect>
+                    <rect x="14" y="14" width="7" height="7"></rect>
+                    <rect x="3" y="14" width="7" height="7"></rect>
+                </svg>
+                Dashboard
+            </button>
+            <button class="nav-tab" onclick="switchTab(event, 'stats')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="2" x2="12" y2="22"></line>
+                    <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+                </svg>
+                Statistics
+            </button>
+            <button class="nav-tab" onclick="switchTab(event, 'settings')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M12 1v6m0 6v6M4.22 4.22l4.24 4.24m2.12 2.12l4.24 4.24M1 12h6m6 0h6m-16.78 7.78l4.24-4.24m2.12-2.12l4.24-4.24"></path>
+                </svg>
+                Settings
+            </button>
+        </div>
+    </nav>
+
+    <main class="main-content">
+        <!-- Dashboard Tab -->
+        <div id="dashboard" class="tab-content active">
+            <div class="page-header">
+                <div>
+                    <h2>Dashboard</h2>
+                    <p class="page-subtitle">Intel QSV Hardware Acceleration • Auto Run 01:00 - 07:00</p>
+                </div>
+            </div>
+
+            <!-- System Stats -->
+            <div class="grid grid-3">
+                <div class="metric-card">
+                    <div class="metric-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                            <rect x="4" y="4" width="16" height="16" rx="2"></rect>
+                            <rect x="9" y="9" width="6" height="6"></rect>
+                        </svg>
+                    </div>
+                    <div class="metric-body">
+                        <span class="metric-label">CPU Load</span>
+                        <div id="cpu-stats" class="metric-value">-</div>
+                    </div>
+                </div>
+
+                <div class="metric-card">
+                    <div class="metric-icon temp-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                            <path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"></path>
+                        </svg>
+                    </div>
+                    <div class="metric-body">
+                        <span class="metric-label">CPU Temp</span>
+                        <div id="temp-stats" class="metric-value">-</div>
+                    </div>
+                </div>
+
+                <div class="metric-card">
+                    <div class="metric-icon mem-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                            <rect x="4" y="2" width="16" height="20" rx="2" ry="2"></rect>
+                            <line x1="8" y1="6" x2="16" y2="6"></line>
+                            <line x1="8" y1="10" x2="16" y2="10"></line>
+                            <line x1="8" y1="14" x2="16" y2="14"></line>
+                            <line x1="8" y1="18" x2="16" y2="18"></line>
+                        </svg>
+                    </div>
+                    <div class="metric-body">
+                        <span class="metric-label">Memory</span>
+                        <div id="ram-stats" class="metric-value">-</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status & Action Row -->
+            <div class="grid grid-2 gap-large">
+                <!-- Status Card -->
+                <div class="card">
+                    <div class="card-header">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <polyline points="12 6 12 12 16 14"></polyline>
+                        </svg>
+                        Current Job
+                    </div>
+                    <div id="status-card" class="job-status">Idle</div>
+                </div>
+
+                <!-- Action Card -->
+                <div id="action-card" class="card action-card"></div>
+            </div>
+
+            <!-- Storage Drives -->
+            <div id="drives-container" class="grid grid-3"></div>
+
+            <!-- Recent Jobs Table -->
+            <div class="card">
+                <div class="card-header">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    Recent Jobs
+                </div>
+                <div class="table-wrapper">
+                    <table class="jobs-table">
+                        <thead>
+                            <tr>
+                                <th>Filename</th>
+                                <th>Status</th>
+                                <th>Original</th>
+                                <th>Result</th>
+                                <th>Saved</th>
+                                <th>Finished</th>
+                            </tr>
+                        </thead>
+                        <tbody id="table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Statistics Tab -->
+        <div id="stats" class="tab-content">
+            <div class="page-header">
+                <div>
+                    <h2>Statistics</h2>
+                    <p class="page-subtitle">7-day overview and performance metrics</p>
+                </div>
+            </div>
+
+            <!-- Key Metrics -->
+            <div class="grid grid-3">
+                <div class="stat-card">
+                    <div class="stat-label">Total Space Saved</div>
+                    <div id="total-saved" class="stat-value saved-color">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Files Processed</div>
+                    <div id="total-processed" class="stat-value">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Success Rate</div>
+                    <div id="success-rate" class="stat-value">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Failed</div>
+                    <div id="total-failed" class="stat-value error-color">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Avg Duration</div>
+                    <div id="avg-duration" class="stat-value">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Avg Saved</div>
+                    <div id="avg-saved" class="stat-value saved-color">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Retry Rate</div>
+                    <div id="retry-rate" class="stat-value">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Retried Jobs</div>
+                    <div id="total-retried-jobs" class="stat-value">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Perma Skipped</div>
+                    <div id="total-perma-skipped" class="stat-value">-</div>
+                </div>
+            </div>
+
+            <!-- Charts -->
+            <div class="grid grid-2">
+                <div class="card">
+                    <div class="chart-title">7-Day Activity</div>
+                    <div id="activity-chart" class="chart"></div>
+                </div>
+                <div class="card">
+                    <div class="chart-title">Space Saved Per Day</div>
+                    <div id="savings-chart" class="chart"></div>
+                </div>
+            </div>
+
+            <!-- Rankings -->
+            <div class="grid grid-2">
+                <div class="card">
+                    <div class="card-header">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path>
+                        </svg>
+                        Best Space Wins
+                    </div>
+                    <ul id="top-savings-list" class="ranking-list"></ul>
+                </div>
+                <div class="card">
+                    <div class="card-header">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <line x1="12" y1="8" x2="12" y2="12"></line>
+                            <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                        </svg>
+                        Most Common Errors
+                    </div>
+                    <ul id="top-errors-list" class="ranking-list"></ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Settings Tab -->
+        <div id="settings" class="tab-content">
+            <div class="page-header">
+                <div>
+                    <h2>Settings</h2>
+                    <p class="page-subtitle">Configure transcoding and directories</p>
+                </div>
+            </div>
+
+            <!-- Quality Settings -->
+            <div class="card">
+                <div class="card-header">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="4" y="2" width="16" height="20" rx="2"></rect>
+                        <line x1="8" y1="6" x2="16" y2="6"></line>
+                        <line x1="8" y1="14" x2="16" y2="14"></line>
+                        <line x1="8" y1="18" x2="16" y2="18"></line>
+                    </svg>
+                    Encoding Quality
+                </div>
+                <div class="settings-group">
+                    <label class="setting-label">FFmpeg Global Quality</label>
+                    <div class="quality-control">
+                        <input type="range" id="quality-slider" min="1" max="3" step="1" onchange="saveQuality()" class="quality-slider">
+                        <div class="quality-labels">
+                            <span>Low (28)</span>
+                            <span>Balanced (23)</span>
+                            <span>High (18)</span>
+                        </div>
+                    </div>
+                    <p class="setting-hint">Lower values = smaller files, higher values = better quality</p>
+                </div>
+            </div>
+
+            <!-- Directories -->
+            <div class="card">
+                <div class="card-header">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    Monitored Directories
+                </div>
+                <ul id="dir-list" class="settings-list"></ul>
+                <div class="settings-add">
+                    <form onsubmit="addDir(event)" class="add-form">
+                        <div class="input-group">
+                            <div class="input-wrapper">
+                                <input type="text" id="new-dir" placeholder="/home/user/videos..." autocomplete="off" oninput="suggestDir()" onclick="suggestDir()">
+                                <div id="dir-suggestions" class="suggestions-dropdown"></div>
+                            </div>
+                            <button type="submit" class="btn btn-primary">Add</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Permanently Skipped -->
+            <div class="card">
+                <div class="card-header">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="8" y1="12" x2="16" y2="12"></line>
+                    </svg>
+                    Permanently Skipped Media
+                </div>
+                <ul id="skip-list" class="settings-list"></ul>
+            </div>
+        </div>
+    </main>
+</body>
+</html>

@@ -6,13 +6,15 @@ import time
 import threading
 import json
 import re
-from datetime import datetime
-from flask import Flask, render_template_string, jsonify, request, redirect
+from datetime import datetime, timedelta
+from flask import Flask, render_template, jsonify, request, redirect
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='templates', static_folder='static')
 
 DB_FILE = "transcoder.db"
 ALLOWED_EXTENSIONS = ('.mkv', '.mp4', '.avi', '.mov')
+MAX_TRANSCODE_RETRIES = 2
+RETRY_BACKOFF_SECONDS = 8
 
 # Events & state
 force_scan_event = threading.Event()
@@ -119,7 +121,8 @@ def init_db():
             status TEXT,
             error_log TEXT,
             started_at DATETIME,
-            finished_at DATETIME
+            finished_at DATETIME,
+            attempt_count INTEGER DEFAULT 0
         )
     ''')
     c.execute('''
@@ -135,6 +138,10 @@ def init_db():
         )
     ''')
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('quality', '23')")
+    c.execute("PRAGMA table_info(conversions)")
+    existing_columns = {row[1] for row in c.fetchall()}
+    if 'attempt_count' not in existing_columns:
+        c.execute("ALTER TABLE conversions ADD COLUMN attempt_count INTEGER DEFAULT 0")
     c.execute("SELECT COUNT(*) FROM directories")
     if c.fetchone()[0] == 0:
         for d in ["/home/bennetgriese/plex/media/movies", "/home/bennetgriese/plex/media/tv"]:
@@ -178,8 +185,242 @@ def get_video_codec(filepath):
     except:
         return None
 
+def is_transcode_tempfile(filepath):
+    return os.path.basename(filepath).endswith('.hevc.tmp.mkv')
+
+def cleanup_transcode_tempfile(filepath):
+    if is_transcode_tempfile(filepath) and os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+            return True
+        except:
+            return False
+    return False
+
+def parse_db_datetime(value):
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    try:
+        return datetime.fromisoformat(str(value))
+    except:
+        return None
+
+def format_duration(seconds):
+    if seconds is None:
+        return "-"
+
+    total_seconds = int(round(seconds))
+    if total_seconds < 0:
+        return "-"
+
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+def format_percent(value):
+    if value is None:
+        return "-"
+    return f"{round(value, 1)}%"
+
+def get_stats_report():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT filename, filepath, status, old_size_bytes, new_size_bytes,
+               attempt_count, started_at, finished_at, error_log
+        FROM conversions
+        ORDER BY id ASC
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    now = datetime.now()
+    seven_days = [now.date() - timedelta(days=offset) for offset in range(6, -1, -1)]
+    daily = {
+        day.isoformat(): {
+            "label": day.strftime("%a"),
+            "date": day.isoformat(),
+            "completed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "perma_skipped": 0,
+            "cancelled": 0,
+            "retrying": 0,
+            "saved_bytes": 0,
+        }
+        for day in seven_days
+    }
+
+    totals = {
+        "completed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "perma_skipped": 0,
+        "cancelled": 0,
+        "retrying": 0,
+    }
+
+    last_24h = {
+        "completed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "perma_skipped": 0,
+        "cancelled": 0,
+        "saved_bytes": 0,
+    }
+
+    total_saved_bytes = 0
+    total_attempts = 0
+    retried_jobs = 0
+    completed_durations = []
+    top_savings = []
+    error_groups = {}
+
+    cutoff_24h = now - timedelta(hours=24)
+
+    for row in rows:
+        filename, filepath, status, old_size, new_size, attempt_count, started_at, finished_at, error_log = row
+        old_size = old_size or 0
+        new_size = new_size or 0
+        attempt_count = attempt_count or 0
+        status_key = status.lower() if status else None
+        started_dt = parse_db_datetime(started_at)
+        finished_dt = parse_db_datetime(finished_at)
+        saved_bytes = max(old_size - new_size, 0) if status == 'COMPLETED' else 0
+
+        if status_key in totals:
+            totals[status_key] += 1
+
+        if status == 'COMPLETED':
+            total_saved_bytes += saved_bytes
+            total_attempts += max(attempt_count, 1)
+            if attempt_count > 1:
+                retried_jobs += 1
+
+            if started_dt and finished_dt:
+                duration_seconds = (finished_dt - started_dt).total_seconds()
+                if duration_seconds >= 0:
+                    completed_durations.append(duration_seconds)
+
+            top_savings.append({
+                "filename": filename,
+                "filepath": filepath,
+                "saved_bytes": saved_bytes,
+                "saved": format_size(saved_bytes),
+                "attempts": attempt_count or 1,
+                "duration": format_duration((finished_dt - started_dt).total_seconds()) if started_dt and finished_dt else "-",
+            })
+
+        if finished_dt:
+            date_key = finished_dt.date().isoformat()
+            if date_key in daily:
+                if status in ('COMPLETED', 'FAILED', 'SKIPPED', 'PERMA_SKIPPED', 'CANCELLED', 'RETRYING'):
+                    daily[date_key][status.lower()] += 1
+                daily[date_key]["saved_bytes"] += saved_bytes
+
+            if finished_dt >= cutoff_24h:
+                if status == 'COMPLETED':
+                    last_24h["completed"] += 1
+                    last_24h["saved_bytes"] += saved_bytes
+                elif status == 'FAILED':
+                    last_24h["failed"] += 1
+                elif status == 'SKIPPED':
+                    last_24h["skipped"] += 1
+                elif status == 'PERMA_SKIPPED':
+                    last_24h["perma_skipped"] += 1
+                elif status == 'CANCELLED':
+                    last_24h["cancelled"] += 1
+
+        if status == 'FAILED' and error_log:
+            error_key = error_log.strip().splitlines()[0][:140]
+            error_groups[error_key] = error_groups.get(error_key, 0) + 1
+
+    top_savings.sort(key=lambda item: item["saved_bytes"], reverse=True)
+    top_savings = top_savings[:5]
+
+    top_errors = sorted(error_groups.items(), key=lambda item: item[1], reverse=True)[:5]
+    top_errors = [{"message": message, "count": count} for message, count in top_errors]
+
+    total_items = sum(totals.values())
+    success_rate = (totals["completed"] / total_items * 100) if total_items else 0
+    retry_rate = (retried_jobs / totals["completed"] * 100) if totals["completed"] else 0
+    avg_attempts = (total_attempts / totals["completed"]) if totals["completed"] else 0
+    avg_duration = (sum(completed_durations) / len(completed_durations)) if completed_durations else 0
+    avg_saved = (total_saved_bytes / totals["completed"]) if totals["completed"] else 0
+
+    daily_series = []
+    for day in seven_days:
+        key = day.isoformat()
+        entry = daily[key]
+        entry_total = entry["completed"] + entry["failed"] + entry["skipped"] + entry["perma_skipped"] + entry["cancelled"]
+        daily_series.append({
+            **entry,
+            "total": entry_total,
+            "saved": format_size(entry["saved_bytes"]),
+        })
+
+    return {
+        "totals": totals,
+        "saved_bytes": total_saved_bytes,
+        "saved": format_size(total_saved_bytes),
+        "processed": totals["completed"],
+        "skipped": totals["skipped"],
+        "failed": totals["failed"],
+        "perma_skipped": totals["perma_skipped"],
+        "cancelled": totals["cancelled"],
+        "retrying": totals["retrying"],
+        "retried_jobs": retried_jobs,
+        "success_rate": format_percent(success_rate),
+        "retry_rate": format_percent(retry_rate),
+        "avg_attempts": round(avg_attempts, 2),
+        "avg_duration_seconds": round(avg_duration, 2),
+        "avg_duration": format_duration(avg_duration),
+        "avg_saved_bytes": round(avg_saved, 2),
+        "avg_saved": format_size(avg_saved),
+        "last_24h": {
+            **last_24h,
+            "saved": format_size(last_24h["saved_bytes"]),
+        },
+        "daily": daily_series,
+        "top_savings": top_savings,
+        "top_errors": top_errors,
+    }
+
+def is_transient_transcode_error(message):
+    if not message:
+        return False
+
+    transient_patterns = (
+        "resource temporarily unavailable",
+        "device or resource busy",
+        "connection reset by peer",
+        "connection timed out",
+        "broken pipe",
+        "i/o error",
+        "cannot allocate memory",
+        "temporary failure",
+        "could not open output file",
+        "error while opening",
+    )
+
+    normalized = message.lower()
+    return any(pattern in normalized for pattern in transient_patterns)
+
 def process_file(filepath, quality):
     global current_process, transcode_progress, cancel_requested, skip_current_requested
+
+    if is_transcode_tempfile(filepath):
+        cleanup_transcode_tempfile(filepath)
+        return
     
     filename = os.path.basename(filepath)
     try:
@@ -214,8 +455,8 @@ def process_file(filepath, quality):
 
     c.execute('''INSERT OR REPLACE INTO conversions 
                  (filename, filepath, old_size_bytes, status, started_at) 
-                 VALUES (?, ?, ?, 'IN_PROGRESS', ?)''', 
-              (filename, filepath, old_size, datetime.now()))
+                      VALUES (?, ?, ?, 'IN_PROGRESS', ?)''', 
+                  (filename, filepath, old_size, datetime.now()))
     conn.commit()
     print(f"[{datetime.now()}] Transcoding: {filename}")
     
@@ -231,100 +472,130 @@ def process_file(filepath, quality):
     cancel_requested = False
     skip_current_requested = False
     tmp_filepath = filepath + ".hevc.tmp.mkv"
-    
+
     cmd = [
         "docker", "run", "--rm",
         "--device=/dev/dri:/dev/dri",
         "-v", "/home/bennetgriese/plex/media:/home/bennetgriese/plex/media",
         "lscr.io/linuxserver/ffmpeg:latest",
-        "-y", 
-        "-vaapi_device", "/dev/dri/renderD128",
+        "-y",
+        "-init_hw_device", "qsv=hw:/dev/dri/renderD128",
+        "-filter_hw_device", "hw",
         "-i", filepath,
-        "-vf", "format=nv12,hwupload",
-        "-c:v", "hevc_vaapi", "-global_quality", quality,
+        "-vf", "format=nv12,hwupload=extra_hw_frames=64",
+        "-c:v", "hevc_qsv", "-preset", "veryfast", "-async_depth", "8", "-global_quality", quality,
         "-c:a", "copy", "-c:s", "copy",
         tmp_filepath
     ]
-    
+
     try:
-        current_process = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, universal_newlines=True)
-        time_regex = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})")
-        speed_regex = re.compile(r"speed=\s*([\d\.]*x)")
-        fps_regex = re.compile(r"fps=\s*([\d\.]+)")
-        
-        for line in current_process.stderr:
-            if cancel_requested or skip_current_requested:
-                current_process.terminate()
-                break
-                
-            t_match = time_regex.search(line)
-            s_match = speed_regex.search(line)
-            f_match = fps_regex.search(line)
-            
-            if t_match:
-                time_str = t_match.group(1)
-                h, m, s = time_str.split(':')
-                parsed_sec = int(h)*3600 + int(m)*60 + float(s)
-                
-                if duration > 0:
-                    pct = (parsed_sec / duration) * 100
-                    transcode_progress["progress"] = min(round(pct, 1), 100)
-                    
-                if s_match:
-                    speed_str = s_match.group(1)
-                    transcode_progress["speed"] = speed_str
-                    try:
-                        speed_val = float(speed_str.replace('x',''))
-                        if speed_val > 0 and duration > 0:
-                            eta_sec = (duration - parsed_sec) / speed_val
-                            transcode_progress["eta"] = f"{int(eta_sec//60)}m {int(eta_sec%60)}s"
-                    except:
-                        pass
-                        
-                if f_match:
-                    transcode_progress["fps"] = f_match.group(1)
+        retryable_failure = False
+        last_error_message = ""
 
-        current_process.wait()
-        
-        if skip_current_requested:
-            raise Exception("Transcoding was skipped permanently by user.")
-
-        if cancel_requested:
-            raise Exception("Transcoding was cancelled by user.")
-            
-        if current_process.returncode == 0 and os.path.exists(tmp_filepath):
-            new_size = os.path.getsize(tmp_filepath)
-            os.remove(filepath)
-            final_filepath = os.path.splitext(filepath)[0] + ".mkv"
-            os.rename(tmp_filepath, final_filepath)
-            
-            c.execute('''UPDATE conversions 
-                         SET status='COMPLETED', new_size_bytes=?, finished_at=?, filepath=?
-                         WHERE filepath=?''', 
-                      (new_size, datetime.now(), final_filepath, filepath))
+        for attempt in range(1, MAX_TRANSCODE_RETRIES + 2):
+            c.execute("UPDATE conversions SET attempt_count=?, status='IN_PROGRESS', started_at=? WHERE filepath=?", (attempt, datetime.now(), filepath))
             conn.commit()
-            print(f"[{datetime.now()}] Finished: {filename}. Saved {(old_size - new_size)/1024/1024:.2f} MB")
-        else:
-            raise Exception("FFmpeg exited with error code " + str(current_process.returncode))
-            
-    except Exception as e:
-        if os.path.exists(tmp_filepath):
-            os.remove(tmp_filepath)
-        if skip_current_requested:
-            status = 'PERMA_SKIPPED'
-        elif cancel_requested:
-            status = 'CANCELLED'
-        else:
-            status = 'FAILED'
-        c.execute('''UPDATE conversions 
-                     SET status=?, error_log=?, finished_at=?
-                     WHERE filepath=?''', 
-                  (status, str(e), datetime.now(), filepath))
-        conn.commit()
-        print(f"[{datetime.now()}] {status} transcoding {filename}: {e}")
-        
+
+            attempt_log = []
+            try:
+                current_process = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, universal_newlines=True)
+                time_regex = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})")
+                speed_regex = re.compile(r"speed=\s*([\d\.]*x)")
+                fps_regex = re.compile(r"fps=\s*([\d\.]+)")
+
+                for line in current_process.stderr:
+                    attempt_log.append(line)
+                    if cancel_requested or skip_current_requested:
+                        current_process.terminate()
+                        break
+
+                    t_match = time_regex.search(line)
+                    s_match = speed_regex.search(line)
+                    f_match = fps_regex.search(line)
+
+                    if t_match:
+                        time_str = t_match.group(1)
+                        h, m, s = time_str.split(':')
+                        parsed_sec = int(h) * 3600 + int(m) * 60 + float(s)
+
+                        if duration > 0:
+                            pct = (parsed_sec / duration) * 100
+                            transcode_progress["progress"] = min(round(pct, 1), 100)
+
+                        if s_match:
+                            speed_str = s_match.group(1)
+                            transcode_progress["speed"] = speed_str
+                            try:
+                                speed_val = float(speed_str.replace('x', ''))
+                                if speed_val > 0 and duration > 0:
+                                    eta_sec = (duration - parsed_sec) / speed_val
+                                    transcode_progress["eta"] = f"{int(eta_sec // 60)}m {int(eta_sec % 60)}s"
+                            except:
+                                pass
+
+                        if f_match:
+                            transcode_progress["fps"] = f_match.group(1)
+
+                current_process.wait()
+
+                if skip_current_requested:
+                    raise Exception("Transcoding was skipped permanently by user.")
+
+                if cancel_requested:
+                    raise Exception("Transcoding was cancelled by user.")
+
+                if current_process.returncode == 0 and os.path.exists(tmp_filepath):
+                    new_size = os.path.getsize(tmp_filepath)
+                    os.remove(filepath)
+                    final_filepath = os.path.splitext(filepath)[0] + ".mkv"
+                    os.rename(tmp_filepath, final_filepath)
+
+                    c.execute('''UPDATE conversions 
+                                 SET status='COMPLETED', new_size_bytes=?, finished_at=?, filepath=?, error_log=NULL
+                                 WHERE filepath=?''',
+                              (new_size, datetime.now(), final_filepath, filepath))
+                    conn.commit()
+                    print(f"[{datetime.now()}] Finished: {filename}. Saved {(old_size - new_size)/1024/1024:.2f} MB")
+                    break
+
+                raise Exception("FFmpeg exited with error code " + str(current_process.returncode))
+
+            except Exception as e:
+                last_error_message = str(e)
+
+                if os.path.exists(tmp_filepath):
+                    os.remove(tmp_filepath)
+
+                if skip_current_requested:
+                    status = 'PERMA_SKIPPED'
+                elif cancel_requested:
+                    status = 'CANCELLED'
+                else:
+                    retryable_failure = is_transient_transcode_error(last_error_message + "\n" + "".join(attempt_log[-20:]))
+                    if retryable_failure and attempt <= MAX_TRANSCODE_RETRIES:
+                        c.execute('''UPDATE conversions 
+                                     SET status='RETRYING', error_log=?, finished_at=?
+                                     WHERE filepath=?''',
+                                  (f"Attempt {attempt}/{MAX_TRANSCODE_RETRIES + 1}: {last_error_message}", datetime.now(), filepath))
+                        conn.commit()
+                        print(f"[{datetime.now()}] Retry {attempt}/{MAX_TRANSCODE_RETRIES + 1} for {filename}: {last_error_message}")
+                        time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                        continue
+
+                    status = 'FAILED'
+
+                c.execute('''UPDATE conversions 
+                             SET status=?, error_log=?, finished_at=?
+                             WHERE filepath=?''',
+                          (status, last_error_message, datetime.now(), filepath))
+                conn.commit()
+                print(f"[{datetime.now()}] {status} transcoding {filename}: {last_error_message}")
+                break
+
+            finally:
+                current_process = None
+
     finally:
-        current_process = None
         transcode_progress = {}
         skip_current_requested = False
         conn.close()
@@ -350,6 +621,9 @@ def scanner_loop():
             for f in all_files:
                 if cancel_requested:
                     break
+                if is_transcode_tempfile(f):
+                    cleanup_transcode_tempfile(f)
+                    continue
                 if f.lower().endswith(ALLOWED_EXTENSIONS):
                     process_file(f, quality)
                     
@@ -359,538 +633,9 @@ def scanner_loop():
                     
         time.sleep(10)
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Plex Transcoder</title>
-    <style>
-        :root {
-            --bg-color: #f5f5f7;
-            --card-bg: #ffffff;
-            --text-main: #1d1d1f;
-            --text-sec: #86868b;
-            --border: rgba(60,60,67,0.1);
-            --acc-blue: #007aff;
-            --acc-green: #34c759;
-            --acc-red: #ff3b30;
-            --acc-yellow: #ffcc00;
-            --control-bg: #e3e3e8;
-            --control-active: #ffffff;
-            --shadow-sm: 0 4px 14px rgba(0,0,0,0.03);
-            --shadow-md: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        @media (prefers-color-scheme: dark) {
-            :root {
-                --bg-color: #000000;
-                --card-bg: #1c1c1e;
-                --text-main: #f2f2f7;
-                --text-sec: #aeaeb2;
-                --border: rgba(84,84,88,0.65);
-                --acc-blue: #0a84ff;
-                --acc-green: #32d74b;
-                --acc-red: #ff453a;
-                --acc-yellow: #ffd60a;
-                --control-bg: #2c2c2e;
-                --control-active: #636366;
-                --shadow-sm: 0 4px 14px rgba(0,0,0,0.4);
-                --shadow-md: 0 1px 3px rgba(0,0,0,0.3);
-            }
-        }
-        * { box-sizing: border-box; -webkit-font-smoothing: antialiased; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
-            background-color: var(--bg-color); 
-            color: var(--text-main); 
-            padding: 0; 
-            margin: 0; 
-        }
-        .navbar {
-            background-color: rgba(255, 255, 255, 0.7);
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            border-bottom: 1px solid var(--border);
-            padding: 12px 20px;
-            position: sticky;
-            top: 0;
-            z-index: 50;
-            display: flex;
-            justify-content: center;
-        }
-        @media (prefers-color-scheme: dark) {
-            .navbar { background-color: rgba(28, 28, 30, 0.7); }
-        }
-        .nav-content { max-width: 1100px; width: 100%; display: flex; justify-content: space-between; align-items: center; }
-        .nav-title { font-weight: 600; font-size: 18px; display: flex; align-items: center; gap: 8px; letter-spacing: -0.3px;}
-        
-        .container { max-width: 1100px; width: 100%; margin: 40px auto; padding: 0 20px; }
-        
-        h1 { font-weight: 700; font-size: 34px; margin-bottom: 8px; letter-spacing: -0.5px; }
-        p.subtitle { color: var(--text-sec); margin-top: 0; margin-bottom: 30px; font-size: 16px; font-weight: 400; }
-        
-        /* Apple Segmented Control */
-        .segmented-control { display: inline-flex; background: var(--control-bg); border-radius: 9px; padding: 2px; margin-bottom: 30px; }
-        .tab { cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text-main); padding: 6px 18px; border-radius: 7px; transition: all 0.2s ease; }
-        .tab.active { background: var(--control-active); box-shadow: var(--shadow-md); }
-        .tab-content { display: none; animation: fadeIn 0.3s ease; }
-        .tab-content.active { display: block; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-
-        .header-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .card { 
-            background-color: var(--card-bg); 
-            border-radius: 18px; 
-            padding: 24px; 
-            box-shadow: var(--shadow-sm);
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            position: relative;
-            overflow: hidden;
-        }
-        .card-header { display: flex; align-items: center; gap: 8px; color: var(--text-sec); font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;}
-        .card-value { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-        
-        .btn { 
-            background-color: var(--acc-blue); color: white; padding: 12px 20px; border-radius: 20px; border: none; 
-            cursor: pointer; font-size: 15px; font-weight: 600; display: inline-flex; align-items: center; gap: 8px;
-            transition: all 0.2s ease; text-decoration: none; justify-content: center;
-        }
-        .btn-red { background-color: var(--acc-red); color: white; }
-        .btn:hover { opacity: 0.9; transform: scale(0.98); }
-        
-        .sp { animation: spin 2s linear infinite; }
-        @keyframes spin { 100% { transform: rotate(360deg); } }
-        
-        /* List Style UI */
-        .list-card { background: var(--card-bg); border-radius: 18px; box-shadow: var(--shadow-sm); overflow: hidden; margin-bottom: 30px; padding: 0;}
-        .list-header { padding: 16px 20px; border-bottom: 1px solid var(--border); background: rgba(0,0,0,0.01); display: flex; justify-content: space-between; align-items: center; }
-        .list-title { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
-        
-        .table-responsive { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
-        table { width: 100%; border-collapse: collapse; background-color: var(--card-bg); border-radius: 14px; overflow: hidden; border: 1px solid var(--border); box-shadow: 0 4px 6px rgba(0,0,0,0.02); }
-        th, td { padding: 14px 16px; text-align: left; font-size: 14px; border-bottom: 1px solid var(--border); }
-        th { color: var(--text-sec); font-weight: 500; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
-        tr:last-child td { border-bottom: none; }
-        
-        .status-badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
-        .COMPLETED { background-color: rgba(52, 199, 89, 0.15); color: var(--acc-green); }
-        .FAILED { background-color: rgba(255, 59, 48, 0.15); color: var(--acc-red); }
-        .CANCELLED { background-color: rgba(255, 59, 48, 0.15); color: var(--acc-red); }
-        .IN_PROGRESS { background-color: rgba(255, 204, 0, 0.15); color: var(--acc-yellow); }
-        .SKIPPED { background-color: rgba(142, 142, 147, 0.15); color: var(--text-sec); }
-        .PERMA_SKIPPED { background-color: rgba(142, 142, 147, 0.15); color: var(--text-sec); }
-        
-        .icon { width: 18px; height: 18px; display: block; }
-        .icon-sm { width: 16px; height: 16px; display: block; min-width: 16px;}
-        .icon-lg { width: 28px; height: 28px; display: block; margin-right: 6px; color: var(--acc-blue); }
-        
-        .form-group { margin-bottom: 20px; padding: 0 20px;}
-        label { display: block; font-weight: 500; margin-bottom: 12px; font-size: 14px;}
-        input[type="range"] { width: 100%; max-width: 400px; accent-color: var(--acc-blue); }
-        .range-labels { display: flex; justify-content: space-between; max-width: 400px; color: var(--text-sec); font-size: 12px; margin-top: 8px; font-weight: 500; }
-        input[type="text"] { width: 100%; max-width: 400px; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--border); background: transparent; color: var(--text-main); font-size: 15px;}
-        input[type="text"]:focus { outline: none; border-color: var(--acc-blue); box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.2); }
-        
-        .dir-list { list-style: none; padding: 0; margin: 0; }
-        .dir-item { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--border); }
-        .dir-item:last-child { border-bottom: none; }
-        .dir-path { font-size: 15px; font-weight: 500; }
-        
-        /* Grid Layout for specific layout scenarios */
-        .layout-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; align-items: stretch;}
-        @media (max-width: 900px) {
-            .layout-grid { grid-template-columns: 1fr; gap: 16px; }
-            .container { margin: 20px auto; padding: 0 16px; }
-            h1 { font-size: 28px; }
-            .btn { width: 100%; justify-content: center; }
-            #action-card { padding: 16px 0 !important; align-items: stretch !important; flex: none !important; }
-            .card { padding: 20px; }
-            .card-value { font-size: 24px !important; }
-            
-            /* Responsive Table -> Cards for Mobile */
-            .table-responsive { background: transparent; border: none; box-shadow: none; overflow: visible; }
-            table { border: none; background: transparent; box-shadow: none; display: block; border-radius: 0; }
-            thead { display: none; }
-            tbody { display: flex; flex-direction: column; gap: 12px; }
-            tr.table-row-card { display: flex; flex-direction: column; background: var(--card-bg); border-radius: 16px; padding: 16px; border: 1px solid var(--border); box-shadow: var(--shadow-sm); position: relative; }
-            tr.table-row-card td { display: flex; justify-content: space-between; align-items: center; border: none; padding: 6px 0; font-size: 14px; white-space: normal; line-height: 1.4; }
-            tr.table-row-card td::before { content: attr(data-label); font-size: 12px; font-weight: 500; color: var(--text-sec); text-transform: uppercase; letter-spacing: 0.5px; width: 40%; flex-shrink: 0; }
-            tr.table-row-card td.td-filename { font-weight: 600 !important; font-size: 15px; margin-bottom: 8px; flex-direction: column; align-items: flex-start; padding-bottom: 8px; padding-right: 105px; border-bottom: 1px solid var(--border); word-break: break-all; }
-            tr.table-row-card td.td-filename::before { display: none; }
-            tr.table-row-card td.td-status { position: absolute; top: 12px; right: 16px; padding: 0; }
-            tr.table-row-card td.td-status::before { display: none; }
-        }
-    </style>
-    <script>
-        function switchTab(event, tabId) {
-            if (event) {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                event.target.classList.add('active');
-            }
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.getElementById(tabId).classList.add('active');
-            if(tabId === 'stats') loadStats();
-            if(tabId === 'settings') loadSettings();
-        }
-
-        function cancelScan() {
-            if(confirm("Cancel the current transcoding job? The original file will be safely kept and the temporary file deleted.")) {
-                fetch('/api/cancel', { method: 'POST' }).then(() => updateDashboard());
-            }
-        }
-
-        function skipCurrentMedia() {
-            if(confirm("Skip this media permanently? It will be written to DB and never transcoded again.")) {
-                fetch('/api/skip_current', { method: 'POST' }).then(() => updateDashboard());
-            }
-        }
-
-        function updateDashboard() {
-            fetch('/api/status')
-            .then(response => response.json())
-            .then(data => {
-                document.getElementById('cpu-stats').innerText = data.cpu_stats;
-                document.getElementById('temp-stats').innerText = data.temp_stats;
-                document.getElementById('ram-stats').innerText = data.ram_stats;
-                
-                const statusCard = document.getElementById('status-card');
-                const actionCard = document.getElementById('action-card');
-                
-                if (data.is_scanning) {
-                    let progHtml = '';
-                    if(data.progress && data.progress.filename) {
-                        progHtml = `
-                        <div style="width: 100%; margin-top: 15px; font-size: 14px;">
-                            <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
-                                <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%; font-weight: 500;">${data.progress.filename}</span>
-                                <span style="font-weight: 700; color: var(--acc-blue);">${data.progress.progress}%</span>
-                            </div>
-                            <div style="width: 100%; height: 8px; background: var(--control-bg); border-radius: 4px; overflow: hidden;">
-                                <div style="width: ${data.progress.progress}%; height: 100%; background: var(--acc-blue); transition: width 0.4s ease-out;"></div>
-                            </div>
-                            <div style="display: flex; justify-content: space-between; margin-top: 8px; color: var(--text-sec); font-size: 13px; font-weight: 500;">
-                                <span>Speed: ${data.progress.speed} &bull; FPS: ${data.progress.fps}</span>
-                                <span>ETA: ${data.progress.eta}</span>
-                            </div>
-                        </div>`;
-                    }
-
-                    statusCard.innerHTML = `<span style="display:flex; align-items:center; gap:8px;"><svg class="icon-sm sp" style="color: var(--acc-blue);" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="4.93" x2="19.07" y2="7.76"></line></svg> Transcoding...</span>${progHtml}`;
-                    
-                    actionCard.innerHTML = `<div style="display:flex; flex-direction:column; gap:12px; width:100%;">
-                        <button class="btn" onclick="skipCurrentMedia()" style="width: 100%; background: var(--acc-yellow); color: #1d1d1f;">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><path d="M12 5v14"></path></svg>
-                        Skip Forever</button>
-                        <button class="btn btn-red" onclick="cancelScan()" style="width: 100%;">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                        Cancel Job</button>
-                    </div>`;
-                } else {
-                    statusCard.innerHTML = "Idle";
-                    actionCard.innerHTML = `<form action="/start_scan" method="POST" style="margin:0; width: 100%;">
-                        <button class="btn" id="start-btn" type="submit" style="width: 100%;">
-                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
-                        Start Scan</button></form>`;
-                }
-
-                let rowsHtml = '';
-                data.rows.forEach(row => {
-                    let fileName = row[1];
-                    rowsHtml += `<tr class="table-row-card">
-                        <td data-label="Filename" class="td-filename" style="font-weight: 500;">${fileName}</td>
-                        <td data-label="Status" class="td-status"><span class="status-badge ${row[2]}">${row[2]}</span></td>
-                        <td data-label="Orig. Size" style="color: var(--text-sec);">${row[3]}</td>
-                        <td data-label="New Size" style="color: var(--text-sec);">${row[4]}</td>
-                        <td data-label="Saved" style="font-weight: 600; color: var(--acc-green);">${row[5]}</td>
-                        <td data-label="Finished" style="color: var(--text-sec);">${row[6]}</td>
-                    </tr>`;
-                });
-                document.getElementById('table-body').innerHTML = rowsHtml;
-
-                let drivesHtml = '<div class="header-cards" style="margin-bottom: 24px;">';
-                data.drives.forEach(drive => {
-                    drivesHtml += `<div class="card">
-                        <div class="card-header">
-                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6" y2="6"></line><line x1="6" y1="18" x2="6" y2="18"></line></svg>
-                            ${drive.mount}
-                        </div>
-                        <div class="card-value" style="font-size: 24px;">${drive.free} free</div>
-                        <div style="color: var(--text-sec); font-size: 13px; font-weight: 500; margin-top: 4px;">Total: ${drive.total} &bull; ${drive.perc} used</div>
-                    </div>`;
-                });
-                drivesHtml += '</div>';
-                document.getElementById('drives-container').innerHTML = drivesHtml;
-            });
-        }
-        
-        function loadStats() {
-            fetch('/api/stats')
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById('total-saved').innerText = data.total_saved;
-                document.getElementById('total-processed').innerText = data.total_processed;
-                document.getElementById('total-skipped').innerText = data.total_skipped;
-                document.getElementById('total-failed').innerText = data.total_failed;
-                document.getElementById('total-perma-skipped').innerText = data.total_perma_skipped;
-            });
-        }
-        
-        function loadSettings() {
-            fetch('/api/settings')
-            .then(res => res.json())
-            .then(data => {
-                const qSlider = document.getElementById('quality-slider');
-                qSlider.value = data.quality === '18' ? 3 : (data.quality === '23' ? 2 : 1);
-                
-                let dirHtml = '';
-                data.directories.forEach(d => {
-                    dirHtml += `<li class="dir-item">
-                        <span class="dir-path">${d.path}</span>
-                        <button onclick="removeDir(${d.id})" class="btn btn-red" style="padding: 6px 14px; font-size: 13px; background: rgba(255, 59, 48, 0.15); color: var(--acc-red);">Remove</button>
-                    </li>`;
-                });
-                document.getElementById('dir-list').innerHTML = dirHtml;
-            });
-        }
-        
-        function saveQuality() {
-            const val = document.getElementById('quality-slider').value;
-            const q = val == 3 ? '18' : (val == 2 ? '23' : '28');
-            fetch('/api/settings/quality', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({quality: q})
-            });
-        }
-        
-        function suggestDir() {
-            const input = document.getElementById('new-dir');
-            const drop = document.getElementById('dir-suggestions');
-            let val = input.value;
-            
-            if (val.length === 0) val = '/';
-            
-            fetch('/api/suggest_dir?path=' + encodeURIComponent(val))
-            .then(r => r.json())
-            .then(data => {
-                if (data.folders && data.folders.length > 0) {
-                    drop.innerHTML = data.folders.map(f => {
-                        const safePath = f.path.replace(/"/g, '&quot;');
-                        return `<div style="padding: 12px 16px; cursor: pointer; border-bottom: 1px solid var(--border); display: flex; align-items: center; font-size: 14px;" 
-                                      onclick="selectDir(event, this.dataset.path)" data-path="${safePath}"
-                                      onmouseover="this.style.background='var(--bg-color)'"
-                                      onmouseout="this.style.background='transparent'">
-                                    <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="var(--acc-blue)" stroke-width="2" style="margin-right: 12px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-                                    ${f.name}
-                                 </div>`;
-                    }).join('');
-                    drop.style.display = 'block';
-                } else {
-                    drop.style.display = 'none';
-                }
-            });
-        }
-        
-        function selectDir(e, path) {
-            e.preventDefault();
-            e.stopPropagation();
-            const input = document.getElementById('new-dir');
-            input.value = path + '/';
-            document.getElementById('dir-suggestions').style.display = 'none';
-            input.focus();
-            suggestDir(); 
-        }
-
-        document.addEventListener('click', function(e) {
-            if (e.target.id !== 'new-dir') {
-                const drop = document.getElementById('dir-suggestions');
-                if(drop) drop.style.display = 'none';
-            }
-        });
-
-        function addDir(event) {
-            event.preventDefault();
-            const input = document.getElementById('new-dir');
-            fetch('/api/settings/dir', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({path: input.value})
-            }).then(() => { 
-                input.value = ''; 
-                document.getElementById('dir-suggestions').style.display = 'none';
-                loadSettings(); 
-            });
-        }
-        
-        function removeDir(id) {
-            fetch('/api/settings/dir/' + id, {method: 'DELETE'})
-            .then(() => loadSettings());
-        }
-        
-        setInterval(() => {
-            if(document.getElementById('dashboard').classList.contains('active')) updateDashboard();
-        }, 1500);
-        
-        window.onload = function() {
-            updateDashboard();
-        }
-    </script>
-</head>
-<body>
-    <div class="navbar">
-        <div class="nav-content">
-            <span class="nav-title">
-                <svg class="icon-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"></polygon><rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect></svg>
-                Transcoder
-            </span>
-            <div class="segmented-control" style="margin-bottom:0;">
-                <div class="tab active" onclick="switchTab(event, 'dashboard')">Dashboard</div>
-                <div class="tab" onclick="switchTab(event, 'stats')">Statistics</div>
-                <div class="tab" onclick="switchTab(event, 'settings')">Settings</div>
-            </div>
-        </div>
-    </div>
-
-    <div class="container">
-        <h1>Overview</h1>
-        <p class="subtitle">Hardware accelerated with Intel QSV. Automatically runs between 01:00 and 07:00.</p>
-
-        <div id="dashboard" class="tab-content active">
-            <div class="layout-grid">
-                <div>
-                    <div class="header-cards">
-                        <div class="card">
-                            <div class="card-header">
-                                <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect></svg>
-                                CPU Load
-                            </div>
-                            <div id="cpu-stats" class="card-value">-</div>
-                        </div>
-
-                        <div class="card">
-                            <div class="card-header">
-                                <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"></path></svg>
-                                CPU Temp
-                            </div>
-                            <div id="temp-stats" class="card-value">-</div>
-                        </div>
-                        
-                        <div class="card" style="grid-column: 1 / -1;">
-                            <div class="card-header">
-                                <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="4" y1="8" x2="20" y2="8"></line><line x1="4" y1="16" x2="20" y2="16"></line><line x1="8" y1="4" x2="8" y2="20"></line><line x1="16" y1="4" x2="16" y2="20"></line></svg>
-                                Memory Usage
-                            </div>
-                            <div id="ram-stats" class="card-value" style="font-size: 20px;">-</div>
-                        </div>
-                        
-                        <div class="card" style="grid-column: 1 / -1;">
-                            <div class="card-header">
-                                <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                                Current Job Status
-                            </div>
-                            <div id="status-card" class="card-value" style="font-size: 22px; align-items: flex-start; flex-direction: column; width: 100%;">
-                                Idle
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div id="action-card" class="card" style="border:none; box-shadow:none; background:transparent; padding:0; flex: 0.5; justify-content:center; align-items:flex-end;">
-                </div>
-            </div>
-            
-            <div id="drives-container"></div>
-
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Filename</th>
-                            <th>Status</th>
-                            <th>Orig. Size</th>
-                            <th>New Size</th>
-                            <th>Saved</th>
-                            <th>Finished</th>
-                        </tr>
-                    </thead>
-                    <tbody id="table-body">
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <div id="stats" class="tab-content">
-            <div class="header-cards">
-                <div class="card">
-                    <div class="card-header">Total Space Saved</div>
-                    <div id="total-saved" class="card-value" style="color: var(--acc-green); font-size: 32px;">-</div>
-                </div>
-                <div class="card">
-                    <div class="card-header">Files Processed</div>
-                    <div id="total-processed" class="card-value" style="font-size: 32px;">-</div>
-                </div>
-                <div class="card">
-                    <div class="card-header">Files Skipped</div>
-                    <div id="total-skipped" class="card-value" style="font-size: 32px;">-</div>
-                </div>
-                <div class="card">
-                    <div class="card-header">Failed Conversions</div>
-                    <div id="total-failed" class="card-value" style="color: var(--acc-red); font-size: 32px;">-</div>
-                </div>
-                <div class="card">
-                    <div class="card-header">Permanently Skipped</div>
-                    <div id="total-perma-skipped" class="card-value" style="font-size: 32px;">-</div>
-                </div>
-            </div>
-        </div>
-
-        <div id="settings" class="tab-content">
-            <div class="list-card">
-                <div class="list-header">
-                    <span class="list-title">Transcoding Quality</span>
-                </div>
-                <div style="padding: 20px 0;">
-                    <div class="form-group">
-                        <label>Quality Setting (FFmpeg -global_quality)</label>
-                        <input type="range" id="quality-slider" min="1" max="3" step="1" onchange="saveQuality()">
-                        <div class="range-labels">
-                            <span>Low/28 (Smaller Size)</span>
-                            <span>Medium/23 (Balanced)</span>
-                            <span>High/18 (Better Video)</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="list-card">
-                <div class="list-header">
-                    <span class="list-title">Monitored Directories</span>
-                </div>
-                <ul id="dir-list" class="dir-list"></ul>
-                <div style="padding: 20px; border-top: 1px solid var(--border); background: rgba(0,0,0,0.01);">
-                    <form onsubmit="addDir(event)" style="margin: 0;">
-                        <label>Add new directory</label>
-                        <div style="display: flex; gap: 12px; position: relative;">
-                            <div style="flex: 1; position: relative;">
-                                <input type="text" id="new-dir" style="width: 100%; box-sizing: border-box;" placeholder="Type /home/... to browse" oninput="suggestDir()" onclick="suggestDir()" autocomplete="off" required>
-                                <div id="dir-suggestions" style="display: none; position: absolute; width: 100%; top: calc(100% + 8px); background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; max-height: 250px; overflow-y: auto; box-shadow: 0 10px 30px rgba(0,0,0,0.15); z-index: 100;"></div>
-                            </div>
-                            <button type="submit" class="btn">Add Directory</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template('index.html')
 
 @app.route("/api/status")
 def status_api():
@@ -928,31 +673,36 @@ def status_api():
 
 @app.route("/api/stats")
 def stats_api():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT SUM(old_size_bytes - new_size_bytes) FROM conversions WHERE status='COMPLETED'")
-    saved = c.fetchone()[0] or 0
-    
-    c.execute("SELECT COUNT(*) FROM conversions WHERE status='COMPLETED'")
-    processed = c.fetchone()[0]
-    
-    c.execute("SELECT COUNT(*) FROM conversions WHERE status='SKIPPED'")
-    skipped = c.fetchone()[0]
-    
-    c.execute("SELECT COUNT(*) FROM conversions WHERE status='FAILED'")
-    failed = c.fetchone()[0]
+    report = get_stats_report()
 
-    c.execute("SELECT COUNT(*) FROM conversions WHERE status='PERMA_SKIPPED'")
-    perma_skipped = c.fetchone()[0]
-    
-    conn.close()
-    
     return jsonify({
-        "total_saved": format_size(saved),
-        "total_processed": processed,
-        "total_skipped": skipped,
-        "total_failed": failed,
-        "total_perma_skipped": perma_skipped
+        "total_saved": report["saved"],
+        "total_saved_bytes": report["saved_bytes"],
+        "total_processed": report["processed"],
+        "total_skipped": report["skipped"],
+        "total_failed": report["failed"],
+        "total_perma_skipped": report["perma_skipped"],
+        "total_cancelled": report["cancelled"],
+        "total_retried_jobs": report["retried_jobs"],
+        "success_rate": report["success_rate"],
+        "retry_rate": report["retry_rate"],
+        "avg_attempts": report["avg_attempts"],
+        "avg_duration_seconds": report["avg_duration_seconds"],
+        "avg_duration": report["avg_duration"],
+        "avg_saved": report["avg_saved"],
+        "avg_saved_bytes": report["avg_saved_bytes"],
+        "last_24h": {
+            "completed": report["last_24h"]["completed"],
+            "failed": report["last_24h"]["failed"],
+            "skipped": report["last_24h"]["skipped"],
+            "perma_skipped": report["last_24h"]["perma_skipped"],
+            "cancelled": report["last_24h"]["cancelled"],
+            "saved": report["last_24h"]["saved"],
+            "saved_bytes": report["last_24h"]["saved_bytes"],
+        },
+        "daily": report["daily"],
+        "top_savings": report["top_savings"],
+        "top_errors": report["top_errors"],
     })
 
 @app.route("/api/cancel", methods=["POST"])
@@ -1061,6 +811,33 @@ def remove_dir(id):
     conn.commit()
     conn.close()
     return jsonify({"success": True})
+
+@app.route("/api/perma_skipped")
+def perma_skipped_api():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, filename, filepath, finished_at FROM conversions WHERE status='PERMA_SKIPPED' ORDER BY finished_at DESC, id DESC")
+    items = [
+        {
+            "id": row[0],
+            "filename": row[1],
+            "filepath": row[2],
+            "finished_at": row[3]
+        }
+        for row in c.fetchall()
+    ]
+    conn.close()
+    return jsonify({"items": items})
+
+@app.route("/api/perma_skipped/<int:id>", methods=["DELETE"])
+def restore_perma_skipped(id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE conversions SET status='UNSKIPPED', finished_at=? WHERE id=? AND status='PERMA_SKIPPED'", (datetime.now(), id))
+    conn.commit()
+    updated = c.rowcount
+    conn.close()
+    return jsonify({"success": bool(updated), "restored": bool(updated)})
 
 @app.route("/api/suggest_dir")
 def suggest_dir():

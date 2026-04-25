@@ -30,30 +30,35 @@ python3 auto_transcoder.py
 - **Automatic Night Mode**: The script runs autonomously between 01:00 and 07:00 AM to conserve server resources during the day.
 - **Smart Filtering**: Skips files already encoded in HEVC unless they are larger than 5 GB (then they are re-encoded to save space).
 - **Permanent Skip Button**: While a job is running, you can skip the currently converting media permanently. The file is marked as `PERMA_SKIPPED` in SQLite and will never be picked up again.
+- **Unskip Management**: Permanently skipped items can be restored later from the Settings tab, so mistakes are reversible.
+- **Automatic Retries**: Temporary FFmpeg errors are retried automatically before a job is marked as failed.
+- **Tempfile Cleanup**: Leftover `.hevc.tmp.mkv` files are excluded from scans and removed automatically.
 - **Apple-like Web Dashboard**: A minimalist frontend with Dark/Light mode and real-time status updates via AJAX is available at `http://<server-ip>:5000`.
 - **Homepage API**: Exposes compact JSON status at `GET /api/homepage/status` for external dashboards like Homepage.
+- **Rich Statistics Tab**: Shows success rate, retry rate, average encode time, 24h activity, 7-day charts, and top savings/errors.
 - **SQLite Tracking**: All progress, savings, and runtimes are tracked in a local database (`transcoder.db`), preventing accidental duplicate processing.
-- **Hardware Passthrough**: Bypasses missing proprietary Linux host drivers by spawning an `lscr.io/linuxserver/ffmpeg:latest` Docker container for the transcoding job (with `/dev/dri` passthrough).
+- **Hardware Passthrough**: Uses Intel QSV inside an `lscr.io/linuxserver/ffmpeg:latest` Docker container for the transcoding job (with `/dev/dri` passthrough and a speed-oriented preset).
+
+## ⚙️ How does Hardware-Encoding work?
+The system requires a compatible Intel CPU with hardware encoding capabilities (Quick Sync).
+The script accesses the device via `/dev/dri/renderD128` and initializes Intel QSV explicitly.
+To avoid driver conflicts on the host system, the script runs the following Docker command internally for each file:
+```bash
+docker run --rm \
+   --device=/dev/dri:/dev/dri \
+   -v /path/to/your/media:/path/to/your/media \
+   lscr.io/linuxserver/ffmpeg:latest \
+   -y -init_hw_device qsv=hw:/dev/dri/renderD128 \
+   -filter_hw_device hw \
+   -i <INPUT> -vf format=nv12,hwupload=extra_hw_frames=64 -c:v hevc_qsv \
+   -global_quality 23 -c:a copy -c:s copy <OUTPUT.hevc.tmp.mkv>
+```
+This compresses video tracks extremely efficiently via hardware, while audio and subtitles are simply copied unmodified (`copy`).
 
 ## 📁 File Structure
 - `auto_transcoder.py`: The core script. Contains the scanning logic, subprocess calls to Docker, and the integrated Flask web server including the Dashboard HTML/JS.
 - `transcoder.db`: The SQLite database for history and status.
 - `plex-transcoder.service`: The systemd service file ensuring automatic background operation (includes hardware acceleration permissions).
-
-## ⚙️ How does Hardware-Encoding work?
-The system requires a compatible Intel CPU with hardware encoding capabilities (Quick Sync).
-The script accesses the device via `/dev/dri/renderD128`.
-To avoid driver conflicts on the host system, the script runs the following Docker command internally for each file:
-```bash
-docker run --rm \
-  --device=/dev/dri:/dev/dri \
-  -v /path/to/your/media:/path/to/your/media \
-  lscr.io/linuxserver/ffmpeg:latest \
-  -y -vaapi_device /dev/dri/renderD128 \
-  -i <INPUT> -vf format=nv12,hwupload -c:v hevc_vaapi \
-  -global_quality 23 -c:a copy -c:s copy <OUTPUT.hevc.tmp.mkv>
-```
-This compresses video tracks extremely efficiently via hardware, while audio and subtitles are simply copied unmodified (`copy`).
 
 ## 🔍 Monitoring & Status Checks
 
@@ -83,8 +88,18 @@ Besides the web dashboard, you can always check what's going on under the hood v
    - The file is marked as `PERMA_SKIPPED` and future scans will ignore it.
    - Returns `409` if no active conversion exists.
 
+- `GET /api/perma_skipped`
+   - Lists all permanently skipped items for the dashboard UI.
+
+- `DELETE /api/perma_skipped/<id>`
+   - Restores a permanently skipped item by marking it as `UNSKIPPED`.
+   - The file becomes eligible for future scans again.
+
 - `POST /api/cancel`
    - Cancels the current conversion without permanently blocking that file.
+
+- `RETRYING`
+   - Internal status used when a transient FFmpeg failure is being retried automatically.
 
 ## 🛠️ Systemd Service Management
 If the script is set up via systemd:
