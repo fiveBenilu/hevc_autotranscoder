@@ -29,7 +29,9 @@ python3 auto_transcoder.py
 ## 🌟 Features
 - **Automatic Night Mode**: The script runs autonomously between 01:00 and 07:00 AM to conserve server resources during the day.
 - **Smart Filtering**: Skips files already encoded in HEVC unless they are larger than 5 GB (then they are re-encoded to save space).
+- **Permanent Skip Button**: While a job is running, you can skip the currently converting media permanently. The file is marked as `PERMA_SKIPPED` in SQLite and will never be picked up again.
 - **Apple-like Web Dashboard**: A minimalist frontend with Dark/Light mode and real-time status updates via AJAX is available at `http://<server-ip>:5000`.
+- **Homepage API**: Exposes compact JSON status at `GET /api/homepage/status` for external dashboards like Homepage.
 - **SQLite Tracking**: All progress, savings, and runtimes are tracked in a local database (`transcoder.db`), preventing accidental duplicate processing.
 - **Hardware Passthrough**: Bypasses missing proprietary Linux host drivers by spawning an `lscr.io/linuxserver/ffmpeg:latest` Docker container for the transcoding job (with `/dev/dri` passthrough).
 
@@ -69,6 +71,20 @@ Besides the web dashboard, you can always check what's going on under the hood v
    ```bash
    docker stats
    ```
+
+## 🔌 API Endpoints
+
+- `GET /api/homepage/status`
+   - Compact operational summary for Homepage widgets.
+   - Includes current state (`is_scanning`), active progress (`current`), status counts, last completed file, and host metrics.
+
+- `POST /api/skip_current`
+   - Permanently skips the currently converting file.
+   - The file is marked as `PERMA_SKIPPED` and future scans will ignore it.
+   - Returns `409` if no active conversion exists.
+
+- `POST /api/cancel`
+   - Cancels the current conversion without permanently blocking that file.
 
 ## 🛠️ Systemd Service Management
 If the script is set up via systemd:

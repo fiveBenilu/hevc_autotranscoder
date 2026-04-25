@@ -20,6 +20,7 @@ is_scanning = False
 current_process = None
 transcode_progress = {}
 cancel_requested = False
+skip_current_requested = False
 
 def get_sys_stats():
     # RAM calculation
@@ -178,7 +179,7 @@ def get_video_codec(filepath):
         return None
 
 def process_file(filepath, quality):
-    global current_process, transcode_progress, cancel_requested
+    global current_process, transcode_progress, cancel_requested, skip_current_requested
     
     filename = os.path.basename(filepath)
     try:
@@ -192,7 +193,7 @@ def process_file(filepath, quality):
     c.execute("SELECT status FROM conversions WHERE filepath=?", (filepath,))
     row = c.fetchone()
     
-    if row and row[0] in ('COMPLETED', 'IN_PROGRESS', 'SKIPPED'):
+    if row and row[0] in ('COMPLETED', 'IN_PROGRESS', 'SKIPPED', 'PERMA_SKIPPED'):
         if row[0] != 'IN_PROGRESS':
             conn.close()
             return
@@ -221,12 +222,14 @@ def process_file(filepath, quality):
     duration = get_video_duration(filepath)
     transcode_progress = {
         "filename": filename,
+        "filepath": filepath,
         "progress": 0,
         "fps": "-",
         "speed": "-",
         "eta": "-"
     }
     cancel_requested = False
+    skip_current_requested = False
     tmp_filepath = filepath + ".hevc.tmp.mkv"
     
     cmd = [
@@ -250,7 +253,7 @@ def process_file(filepath, quality):
         fps_regex = re.compile(r"fps=\s*([\d\.]+)")
         
         for line in current_process.stderr:
-            if cancel_requested:
+            if cancel_requested or skip_current_requested:
                 current_process.terminate()
                 break
                 
@@ -283,6 +286,9 @@ def process_file(filepath, quality):
 
         current_process.wait()
         
+        if skip_current_requested:
+            raise Exception("Transcoding was skipped permanently by user.")
+
         if cancel_requested:
             raise Exception("Transcoding was cancelled by user.")
             
@@ -304,7 +310,12 @@ def process_file(filepath, quality):
     except Exception as e:
         if os.path.exists(tmp_filepath):
             os.remove(tmp_filepath)
-        status = 'CANCELLED' if cancel_requested else 'FAILED'
+        if skip_current_requested:
+            status = 'PERMA_SKIPPED'
+        elif cancel_requested:
+            status = 'CANCELLED'
+        else:
+            status = 'FAILED'
         c.execute('''UPDATE conversions 
                      SET status=?, error_log=?, finished_at=?
                      WHERE filepath=?''', 
@@ -315,15 +326,17 @@ def process_file(filepath, quality):
     finally:
         current_process = None
         transcode_progress = {}
+        skip_current_requested = False
         conn.close()
 
 def scanner_loop():
-    global is_scanning, cancel_requested
+    global is_scanning, cancel_requested, skip_current_requested
     while True:
         if is_night_time() or force_scan_event.is_set():
             is_scanning = True
             force_scan_event.clear()
             cancel_requested = False
+            skip_current_requested = False
             
             settings = get_settings()
             quality = settings["quality"]
@@ -342,6 +355,7 @@ def scanner_loop():
                     
             is_scanning = False
             cancel_requested = False
+            skip_current_requested = False
                     
         time.sleep(10)
 
@@ -467,6 +481,7 @@ HTML_TEMPLATE = """
         .CANCELLED { background-color: rgba(255, 59, 48, 0.15); color: var(--acc-red); }
         .IN_PROGRESS { background-color: rgba(255, 204, 0, 0.15); color: var(--acc-yellow); }
         .SKIPPED { background-color: rgba(142, 142, 147, 0.15); color: var(--text-sec); }
+        .PERMA_SKIPPED { background-color: rgba(142, 142, 147, 0.15); color: var(--text-sec); }
         
         .icon { width: 18px; height: 18px; display: block; }
         .icon-sm { width: 16px; height: 16px; display: block; min-width: 16px;}
@@ -527,6 +542,12 @@ HTML_TEMPLATE = """
             }
         }
 
+        function skipCurrentMedia() {
+            if(confirm("Skip this media permanently? It will be written to DB and never transcoded again.")) {
+                fetch('/api/skip_current', { method: 'POST' }).then(() => updateDashboard());
+            }
+        }
+
         function updateDashboard() {
             fetch('/api/status')
             .then(response => response.json())
@@ -559,9 +580,14 @@ HTML_TEMPLATE = """
 
                     statusCard.innerHTML = `<span style="display:flex; align-items:center; gap:8px;"><svg class="icon-sm sp" style="color: var(--acc-blue);" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="4.93" x2="19.07" y2="7.76"></line></svg> Transcoding...</span>${progHtml}`;
                     
-                    actionCard.innerHTML = `<button class="btn btn-red" onclick="cancelScan()" style="width: 100%;">
+                    actionCard.innerHTML = `<div style="display:flex; flex-direction:column; gap:12px; width:100%;">
+                        <button class="btn" onclick="skipCurrentMedia()" style="width: 100%; background: var(--acc-yellow); color: #1d1d1f;">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><path d="M12 5v14"></path></svg>
+                        Skip Forever</button>
+                        <button class="btn btn-red" onclick="cancelScan()" style="width: 100%;">
                         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                        Cancel Job</button>`;
+                        Cancel Job</button>
+                    </div>`;
                 } else {
                     statusCard.innerHTML = "Idle";
                     actionCard.innerHTML = `<form action="/start_scan" method="POST" style="margin:0; width: 100%;">
@@ -608,6 +634,7 @@ HTML_TEMPLATE = """
                 document.getElementById('total-processed').innerText = data.total_processed;
                 document.getElementById('total-skipped').innerText = data.total_skipped;
                 document.getElementById('total-failed').innerText = data.total_failed;
+                document.getElementById('total-perma-skipped').innerText = data.total_perma_skipped;
             });
         }
         
@@ -812,6 +839,10 @@ HTML_TEMPLATE = """
                     <div class="card-header">Failed Conversions</div>
                     <div id="total-failed" class="card-value" style="color: var(--acc-red); font-size: 32px;">-</div>
                 </div>
+                <div class="card">
+                    <div class="card-header">Permanently Skipped</div>
+                    <div id="total-perma-skipped" class="card-value" style="font-size: 32px;">-</div>
+                </div>
             </div>
         </div>
 
@@ -910,6 +941,9 @@ def stats_api():
     
     c.execute("SELECT COUNT(*) FROM conversions WHERE status='FAILED'")
     failed = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM conversions WHERE status='PERMA_SKIPPED'")
+    perma_skipped = c.fetchone()[0]
     
     conn.close()
     
@@ -917,17 +951,82 @@ def stats_api():
         "total_saved": format_size(saved),
         "total_processed": processed,
         "total_skipped": skipped,
-        "total_failed": failed
+        "total_failed": failed,
+        "total_perma_skipped": perma_skipped
     })
 
 @app.route("/api/cancel", methods=["POST"])
 def cancel_scan():
-    global cancel_requested, current_process
+    global cancel_requested, skip_current_requested, current_process
     if is_scanning:
         cancel_requested = True
+        skip_current_requested = False
         if current_process:
             current_process.terminate()
     return jsonify({"success": True})
+
+@app.route("/api/skip_current", methods=["POST"])
+def skip_current():
+    global skip_current_requested, cancel_requested, current_process
+    if not is_scanning or not transcode_progress.get("filepath"):
+        return jsonify({"success": False, "error": "No active conversion"}), 409
+
+    skip_current_requested = True
+    cancel_requested = False
+    if current_process:
+        current_process.terminate()
+
+    return jsonify({
+        "success": True,
+        "filepath": transcode_progress.get("filepath")
+    })
+
+@app.route("/api/homepage/status")
+def homepage_status_api():
+    cpu, temp, ram = get_sys_stats()
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT status, COUNT(*) FROM conversions GROUP BY status")
+    counts = {row[0]: row[1] for row in c.fetchall()}
+
+    c.execute("SELECT filename, finished_at FROM conversions WHERE status='COMPLETED' ORDER BY id DESC LIMIT 1")
+    last_completed_row = c.fetchone()
+    conn.close()
+
+    progress_payload = {}
+    if is_scanning and transcode_progress.get("filename"):
+        progress_payload = {
+            "filename": transcode_progress.get("filename"),
+            "progress": transcode_progress.get("progress", 0),
+            "fps": transcode_progress.get("fps", "-"),
+            "speed": transcode_progress.get("speed", "-"),
+            "eta": transcode_progress.get("eta", "-")
+        }
+
+    return jsonify({
+        "service": "plex-transcoder",
+        "online": True,
+        "is_scanning": is_scanning,
+        "current": progress_payload,
+        "counts": {
+            "completed": counts.get("COMPLETED", 0),
+            "failed": counts.get("FAILED", 0),
+            "skipped": counts.get("SKIPPED", 0),
+            "perma_skipped": counts.get("PERMA_SKIPPED", 0),
+            "in_progress": counts.get("IN_PROGRESS", 0)
+        },
+        "last_completed": {
+            "filename": last_completed_row[0] if last_completed_row else None,
+            "finished_at": last_completed_row[1] if last_completed_row else None
+        },
+        "host": {
+            "cpu_load": cpu,
+            "cpu_temp": temp,
+            "ram_usage": ram
+        },
+        "updated_at": datetime.now().isoformat(timespec='seconds')
+    })
 
 @app.route("/api/settings")
 def settings_api():
