@@ -138,6 +138,8 @@ def init_db():
         )
     ''')
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('quality', '23')")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('scan_start_hour', '1')")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('scan_end_hour', '7')")
     c.execute("PRAGMA table_info(conversions)")
     existing_columns = {row[1] for row in c.fetchall()}
     if 'attempt_count' not in existing_columns:
@@ -153,18 +155,26 @@ def init_db():
 def get_settings():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key='quality'")
-    row = c.fetchone()
-    q = row[0] if row else "23"
+    c.execute("SELECT key, value FROM settings")
+    settings_dict = {row[0]: row[1] for row in c.fetchall()}
+    q = settings_dict.get('quality', '23')
+    start_hr = int(settings_dict.get('scan_start_hour', '1'))
+    end_hr = int(settings_dict.get('scan_end_hour', '7'))
     
     c.execute("SELECT id, path FROM directories")
     dirs = [{"id": r[0], "path": r[1]} for r in c.fetchall()]
     conn.close()
-    return {"quality": q, "directories": dirs}
+    return {"quality": q, "scan_start_hour": start_hr, "scan_end_hour": end_hr, "directories": dirs}
 
 def is_night_time():
+    s = get_settings()
     hour = datetime.now().hour
-    return 1 <= hour < 7
+    start_hr = s["scan_start_hour"]
+    end_hr = s["scan_end_hour"]
+    if start_hr < end_hr:
+        return start_hr <= hour < end_hr
+    else: # e.g. start at 22, end at 6 (overnight)
+        return hour >= start_hr or hour < end_hr
 
 def get_video_duration(filepath):
     try:
@@ -434,7 +444,7 @@ def process_file(filepath, quality):
     c.execute("SELECT status FROM conversions WHERE filepath=?", (filepath,))
     row = c.fetchone()
     
-    if row and row[0] in ('COMPLETED', 'IN_PROGRESS', 'SKIPPED', 'PERMA_SKIPPED'):
+    if row and row[0] in ('COMPLETED', 'IN_PROGRESS', 'SKIPPED', 'PERMA_SKIPPED', 'FAILED'):
         if row[0] != 'IN_PROGRESS':
             conn.close()
             return
@@ -476,6 +486,8 @@ def process_file(filepath, quality):
     cmd = [
         "docker", "run", "--rm",
         "--device=/dev/dri:/dev/dri",
+        "-e", f"PUID={os.getuid()}",
+        "-e", f"PGID={os.getgid()}",
         "-v", "/home/bennetgriese/plex/media:/home/bennetgriese/plex/media",
         "lscr.io/linuxserver/ffmpeg:latest",
         "-y",
@@ -603,7 +615,8 @@ def process_file(filepath, quality):
 def scanner_loop():
     global is_scanning, cancel_requested, skip_current_requested
     while True:
-        if is_night_time() or force_scan_event.is_set():
+        is_forced = force_scan_event.is_set()
+        if is_night_time() or is_forced:
             is_scanning = True
             force_scan_event.clear()
             cancel_requested = False
@@ -620,6 +633,8 @@ def scanner_loop():
             
             for f in all_files:
                 if cancel_requested:
+                    break
+                if not is_forced and not is_night_time():
                     break
                 if is_transcode_tempfile(f):
                     cleanup_transcode_tempfile(f)
@@ -658,7 +673,8 @@ def status_api():
             format_size(r[3]),
             format_size(r[4]),
             format_size(saved) if saved > 0 else "-",
-            r[8][:16] if r[8] else "-"
+            r[8][:16] if r[8] else "-",
+            r[6] if r[6] else ""
         ))
         
     return jsonify({
@@ -785,9 +801,13 @@ def settings_api():
 @app.route("/api/settings/quality", methods=["POST"])
 def set_quality():
     q = request.json.get("quality", "23")
+    start = request.json.get("scan_start_hour", "1")
+    end = request.json.get("scan_end_hour", "7")
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('quality', ?)", (q,))
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('scan_start_hour', ?)", (start,))
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('scan_end_hour', ?)", (end,))
     conn.commit()
     conn.close()
     return jsonify({"success": True})
@@ -873,6 +893,15 @@ def manual_start():
     force_scan_event.set()
     time.sleep(1) 
     return redirect("/")
+
+@app.route("/api/retry_all_failed", methods=["POST"])
+def retry_all_failed():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM conversions WHERE status='FAILED'")
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
 
 if __name__ == '__main__':
     init_db()

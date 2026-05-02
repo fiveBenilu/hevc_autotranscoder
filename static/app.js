@@ -77,17 +77,38 @@ function updateDashboard() {
             let rowsHtml = '';
             data.rows.forEach(row => {
                 const fileName = escapeHtml(row[1]);
-                const status = row[2].toLowerCase().replace(/_/g, ' ');
-                rowsHtml += `<tr>
-                    <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${fileName}</td>
-                    <td><span class="status-badge ${status}">${row[2]}</span></td>
-                    <td>${row[3]}</td>
-                    <td>${row[4]}</td>
-                    <td style="color: var(--color-green); font-weight: 600;">${row[5]}</td>
-                    <td style="color: var(--text-secondary);">${row[6]}</td>
-                </tr>`;
+                const statusStr = row[2] || 'UNKNOWN';
+                const status = statusStr.toLowerCase().replace(/_/g, ' ');
+                const errorLog = row[7] ? `<div style="margin-top: 12px; padding: 8px 12px; border-radius: 8px; font-size: 11px; font-family: monospace; background: rgba(255, 59, 48, 0.05); color: var(--color-red); word-break: break-word; border: 1px solid rgba(255,59,48,0.1);">${escapeHtml(row[7])}</div>` : '';
+
+                rowsHtml += `
+                    <div class="job-card">
+                        <div class="job-card-header">
+                            <div class="job-filename">${fileName}</div>
+                            <span class="status-badge ${status}">${statusStr}</span>
+                        </div>
+                        <div class="job-card-body">
+                            <div class="job-stat">
+                                <span class="stat-label">Original</span>
+                                <span class="stat-value">${row[3]}</span>
+                            </div>
+                            <div class="job-stat">
+                                <span class="stat-label">Result</span>
+                                <span class="stat-value">${row[4]}</span>
+                            </div>
+                            <div class="job-stat">
+                                <span class="stat-label">Saved</span>
+                                <span class="stat-value saved">${row[5]}</span>
+                            </div>
+                            <div class="job-stat">
+                                <span class="stat-label">Finished</span>
+                                <span class="stat-value secondary">${row[6]}</span>
+                            </div>
+                        </div>
+                        ${errorLog}
+                    </div>`;
             });
-            document.getElementById('table-body').innerHTML = rowsHtml;
+            document.getElementById('jobs-list').innerHTML = rowsHtml || '<div class="empty-state">No jobs yet</div>';
 
             let drivesHtml = '';
             data.drives.forEach(drive => {
@@ -137,12 +158,16 @@ function renderStatsCharts(data) {
         }).join('');
 
         return `
-            <div class="chart-bar">
-                <div style="width: 100%; height: ${barHeight}px; display: flex; flex-direction: column; border-radius: 4px; overflow: hidden; background: var(--bg-tertiary);">
-                    ${segments || '<div style="height: 100%; background: rgba(127,127,127,0.12);"></div>'}
+            <div class="chart-bar" style="height: 100%; justify-content: flex-end;">
+                <div style="width: 100%; flex: 1; display: flex; flex-direction: column; justify-content: flex-end;">
+                    <div style="width: 100%; height: ${barHeight}px; display: flex; flex-direction: column; border-radius: 4px; overflow: hidden; background: var(--bg-tertiary);">
+                        ${segments || '<div style="height: 100%; background: rgba(127,127,127,0.12);"></div>'}
+                    </div>
                 </div>
-                <span class="chart-label">${escapeHtml(day.label)}</span>
-                <span style="font-size: 11px; color: var(--text-tertiary); text-align: center; line-height: 1.2;">${total} jobs<br>${day.saved}</span>
+                <div style="display: flex; flex-direction: column; align-items: center; height: 32px; justify-content: flex-start; margin-top: 4px;">
+                    <span class="chart-label">${escapeHtml(day.label)}</span>
+                    <span style="font-size: 10px; color: var(--text-tertiary); text-align: center; white-space: nowrap; line-height: 1.2;">${total} jobs</span>
+                </div>
             </div>`;
     }).join('');
 
@@ -150,10 +175,14 @@ function renderStatsCharts(data) {
         const savedBytes = day.saved_bytes || 0;
         const barHeight = savedBytes > 0 ? Math.max((savedBytes / savingsMax) * 140, 12) : 12;
         return `
-            <div class="chart-bar">
-                <div style="width: 100%; height: ${barHeight}px; background: var(--color-blue); border-radius: 4px;"></div>
-                <span class="chart-label">${escapeHtml(day.label)}</span>
-                <span style="font-size: 11px; color: var(--text-tertiary); text-align: center; line-height: 1.2;">${day.saved}<br>${day.completed} done</span>
+            <div class="chart-bar" style="height: 100%; justify-content: flex-end;">
+                <div style="width: 100%; flex: 1; display: flex; flex-direction: column; justify-content: flex-end;">
+                    <div style="width: 100%; height: ${barHeight}px; background: var(--color-blue); border-radius: 4px;"></div>
+                </div>
+                <div style="display: flex; flex-direction: column; align-items: center; height: 32px; justify-content: flex-start; margin-top: 4px;">
+                    <span class="chart-label">${escapeHtml(day.label)}</span>
+                    <span style="font-size: 10px; color: var(--text-tertiary); text-align: center; white-space: nowrap; line-height: 1.2;">${day.saved}</span>
+                </div>
             </div>`;
     }).join('');
 
@@ -205,7 +234,20 @@ function loadSettings() {
         .then(res => res.json())
         .then(data => {
             const qSlider = document.getElementById('quality-slider');
-            qSlider.value = data.quality === '18' ? 3 : (data.quality === '23' ? 2 : 1);
+            if (qSlider) qSlider.value = data.quality === '18' ? 3 : (data.quality === '23' ? 2 : 1);
+            
+            const startInput = document.getElementById('scan-start');
+            if (startInput) startInput.value = data.scan_start_hour || 1;
+            
+            const endInput = document.getElementById('scan-end');
+            if (endInput) endInput.value = data.scan_end_hour || 7;
+            
+            const windowEl = document.getElementById('auto-run-window');
+            if (windowEl) {
+                const s = String(data.scan_start_hour || 1).padStart(2, '0');
+                const e = String(data.scan_end_hour || 7).padStart(2, '0');
+                windowEl.innerText = `${s}:00 - ${e}:00`;
+            }
             
             let dirHtml = '';
             data.directories.forEach(d => {
@@ -234,14 +276,28 @@ function loadSettings() {
         });
 }
 
-function saveQuality() {
+function saveSettings() {
     const val = document.getElementById('quality-slider').value;
     const q = val == 3 ? '18' : (val == 2 ? '23' : '28');
+    const start = document.getElementById('scan-start').value || '1';
+    const end = document.getElementById('scan-end').value || '7';
+    
     fetch('/api/settings/quality', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ quality: q })
+        body: JSON.stringify({ quality: q, scan_start_hour: start, scan_end_hour: end })
     });
+}
+
+function retryAllFailed() {
+    if (confirm("Retry all previously FAILED jobs? They will be picked up on the next scan.")) {
+        fetch('/api/retry_all_failed', { method: 'POST' })
+            .then(res => res.json())
+            .then(() => {
+                alert("Failed jobs cleared. They will be retried when the scanner runs.");
+                pollStats(); 
+            });
+    }
 }
 
 function suggestDir() {
